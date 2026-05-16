@@ -1,0 +1,14 @@
+# Build outputs
+/k6
+/k6_*
+*.exe
+/fakebgpd
+
+# Go
+/vendor/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

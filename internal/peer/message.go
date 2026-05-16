@@ -1,0 +1,108 @@
+package peer
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net/netip"
+	"time"
+
+	bgp "github.com/osrg/gobgp/v4/pkg/packet/bgp"
+
+	"github.com/higebu/xk6-bgp/internal/packet"
+)
+
+// BuildOpen constructs an OPEN message ready to serialize. routerID must
+// be an IPv4 address per RFC 4271. Local AS values > 0xffff are advertised
+// via AS_TRANS in MyAS + the 4-octet AS capability per RFC 6793 section 9.
+func BuildOpen(localAS uint32, holdTime time.Duration, routerID netip.Addr, caps packet.CapsConfig) (*bgp.BGPMessage, error) {
+	if !routerID.Is4() {
+		return nil, fmt.Errorf("routerId must be an IPv4 address, got %s", routerID)
+	}
+
+	myAS := uint16(localAS) // #nosec G115 -- AS values > 0xffff are masked to AS_TRANS immediately below per RFC 6793 section 9
+	if localAS > 0xffff {
+		myAS = bgp.AS_TRANS
+	}
+
+	if caps.FourOctetAS == 0 {
+		caps.FourOctetAS = localAS
+	}
+
+	params, err := packet.BuildCapabilities(caps)
+	if err != nil {
+		return nil, err
+	}
+
+	hold := uint16(holdTime / time.Second) // #nosec G115 -- HoldTime is a 2-octet field per RFC 4271 section 4.2; values exceeding it are user misconfiguration
+	open, err := bgp.NewBGPOpenMessage(myAS, hold, routerID, []bgp.OptionParameterInterface{
+		bgp.NewOptionParameterCapability(params),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("NewBGPOpenMessage: %w", err)
+	}
+	return open, nil
+}
+
+func BuildKeepalive() *bgp.BGPMessage { return bgp.NewBGPKeepAliveMessage() }
+
+func BuildNotification(code, subcode uint8, data []byte) *bgp.BGPMessage {
+	return bgp.NewBGPNotificationMessage(code, subcode, data)
+}
+
+// ReadMessage pulls one BGP message off r and returns both the raw
+// header+body bytes and the parsed message. Enforces the RFC 4271
+// 4096-byte cap on the message length; for sessions that negotiated
+// RFC 8654 Extended Messages use ReadMessageMax with the higher cap.
+// Callers that just want to re-emit can skip Serialize.
+func ReadMessage(r io.Reader) ([]byte, *bgp.BGPMessage, error) {
+	return ReadMessageMax(r, bgp.BGP_MAX_MESSAGE_LENGTH)
+}
+
+// ReadMessageMax is the variant of ReadMessage that bounds the
+// allocated body buffer at maxLen bytes. Pass
+// packet.BGPExtendedMaxMessageLength only after the RFC 8654 capability
+// has been negotiated by both sides; otherwise a buggy or hostile peer
+// could force the allocation of a 64 KiB read buffer per message.
+func ReadMessageMax(r io.Reader, maxLen int) ([]byte, *bgp.BGPMessage, error) {
+	var hdr [bgp.BGP_HEADER_LENGTH]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, nil, err
+	}
+	for i := range 16 {
+		if hdr[i] != 0xff {
+			return nil, nil, errors.New("BGP header marker is not all-ones")
+		}
+	}
+	mlen := int(binary.BigEndian.Uint16(hdr[16:18]))
+	if mlen < bgp.BGP_HEADER_LENGTH {
+		return nil, nil, fmt.Errorf("BGP message length %d too small", mlen)
+	}
+	if mlen > maxLen {
+		return nil, nil, fmt.Errorf("BGP message length %d exceeds max %d", mlen, maxLen)
+	}
+	full := make([]byte, mlen)
+	copy(full[:bgp.BGP_HEADER_LENGTH], hdr[:])
+	if mlen > bgp.BGP_HEADER_LENGTH {
+		if _, err := io.ReadFull(r, full[bgp.BGP_HEADER_LENGTH:]); err != nil {
+			return nil, nil, err
+		}
+	}
+	msg, err := bgp.ParseBGPMessage(full)
+	if err != nil {
+		return full, nil, err
+	}
+	return full, msg, nil
+}
+
+// WriteMessage serializes msg and writes it as a single Write. The
+// caller owns synchronization.
+func WriteMessage(w io.Writer, msg *bgp.BGPMessage) error {
+	buf, err := msg.Serialize()
+	if err != nil {
+		return fmt.Errorf("BGP serialize: %w", err)
+	}
+	_, err = w.Write(buf)
+	return err
+}

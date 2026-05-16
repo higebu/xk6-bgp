@@ -1,0 +1,114 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build, vet, test, e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race -count=1 ./...
+
+      - name: install xk6
+        run: go install go.k6.io/xk6/cmd/xk6@latest
+
+      - name: xk6 build
+        run: xk6 build --with github.com/higebu/xk6-bgp=.
+
+      - name: build fakebgpd
+        run: go build -o /tmp/fakebgpd ./cmd/fakebgpd
+
+      - name: smoke ipv4-unicast
+        run: |
+          set -euo pipefail
+          /tmp/fakebgpd -listen 127.0.0.1:11790 -families ipv4-unicast -reflect &
+          FAKEBGPD_PID=$!
+          trap 'kill $FAKEBGPD_PID 2>/dev/null || true' EXIT
+          sleep 0.5
+          ./k6 run \
+            -e TARGET=127.0.0.1:11790 \
+            -e COUNT=200 \
+            examples/ipv4_unicast.js \
+            2>&1 | tee /tmp/k6-ipv4.log
+          grep -q 'matched=200' /tmp/k6-ipv4.log
+
+      - name: smoke ipv6-unicast
+        run: |
+          set -euo pipefail
+          /tmp/fakebgpd -listen '[::1]:11790' -families ipv6-unicast -reflect &
+          FAKEBGPD_PID=$!
+          trap 'kill $FAKEBGPD_PID 2>/dev/null || true' EXIT
+          sleep 0.5
+          ./k6 run \
+            -e TARGET='[::1]:11790' \
+            -e COUNT=200 \
+            examples/ipv6_unicast.js \
+            2>&1 | tee /tmp/k6-ipv6.log
+          grep -q 'matched=200' /tmp/k6-ipv6.log
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.6.2
+
+  security:
+    name: gosec
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: securego/gosec@master
+        with:
+          args: ./...
+
+  vulnerability:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: run govulncheck
+        run: govulncheck ./...
