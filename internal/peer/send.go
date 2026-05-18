@@ -12,6 +12,9 @@ import (
 )
 
 type AdvertiseRequest struct {
+	// Family is the AFI/SAFI the caller intends to advertise. Peer.Advertise
+	// rejects routes whose Route.Family() does not match this value and
+	// rejects families not negotiated on the session.
 	Family   bgp.Family
 	Attrs    packet.PathAttrs
 	Routes   []packet.Route
@@ -51,10 +54,13 @@ func (p *Peer) Advertise(req AdvertiseRequest) (AdvertiseResult, error) {
 	if len(req.Routes) == 0 {
 		return AdvertiseResult{}, errors.New("advertise: routes must be non-empty")
 	}
+	if err := validateRouteFamily(req.Family, req.Routes); err != nil {
+		return AdvertiseResult{}, fmt.Errorf("advertise: %w", err)
+	}
 	if req.Encoding.UseExtendedMessages && !p.fsm.extendedMessagesNegotiated {
 		return AdvertiseResult{}, ErrExtendedMessagesNotNegotiated
 	}
-	ts, sent, err := p.fsm.writeUpdates(req.Family, false, req.Attrs, req.Routes, req.Encoding, req.UpdateRate)
+	ts, sent, err := p.fsm.writeUpdates(false, req.Attrs, req.Routes, req.Encoding, req.UpdateRate)
 	if err != nil {
 		return AdvertiseResult{}, fmt.Errorf("advertise: %w", err)
 	}
@@ -68,26 +74,44 @@ func (p *Peer) Withdraw(req WithdrawRequest) (AdvertiseResult, error) {
 	if len(req.Routes) == 0 {
 		return AdvertiseResult{}, errors.New("withdraw: routes must be non-empty")
 	}
+	if err := validateRouteFamily(req.Family, req.Routes); err != nil {
+		return AdvertiseResult{}, fmt.Errorf("withdraw: %w", err)
+	}
 	if req.Encoding.UseExtendedMessages && !p.fsm.extendedMessagesNegotiated {
 		return AdvertiseResult{}, ErrExtendedMessagesNotNegotiated
 	}
-	ts, sent, err := p.fsm.writeUpdates(req.Family, true, packet.PathAttrs{}, req.Routes, req.Encoding, req.UpdateRate)
+	ts, sent, err := p.fsm.writeUpdates(true, packet.PathAttrs{}, req.Routes, req.Encoding, req.UpdateRate)
 	if err != nil {
 		return AdvertiseResult{}, fmt.Errorf("withdraw: %w", err)
 	}
 	return AdvertiseResult{Sent: sent, SentAt: ts}, nil
 }
 
+// validateRouteFamily checks that every Route belongs to the family the
+// caller declared. The check is cheap (a single Family() call per
+// route) and catches JS-side wiring mistakes before they reach the
+// packet encoder, where the diagnostic would be more cryptic.
+func validateRouteFamily(want bgp.Family, routes []packet.Route) error {
+	for i, r := range routes {
+		if r.Family() != want {
+			return fmt.Errorf("routes[%d]: family %s does not match request family %s",
+				i, r.Family(), want)
+		}
+	}
+	return nil
+}
+
 // writeUpdates serializes routes into one or more UPDATE messages,
 // each within BGP_MAX_MESSAGE_LENGTH, and writes them atomically with
 // respect to other writers (the keepalive goroutine in particular).
+// The family is derived from the routes themselves via Route.Family().
 // SentAt is the timestamp captured immediately before the *first*
 // Write — the "submitted to TCP" anchor for delivery math.
-func (f *fsm) writeUpdates(family bgp.Family, withdraw bool, attrs packet.PathAttrs, routes []packet.Route, encoding packet.EncodingOptions, updateRate float64) (timing.Timestamp, int, error) {
+func (f *fsm) writeUpdates(withdraw bool, attrs packet.PathAttrs, routes []packet.Route, encoding packet.EncodingOptions, updateRate float64) (timing.Timestamp, int, error) {
 	if len(routes) == 0 {
 		return timing.Timestamp{}, 0, nil
 	}
-	chunks, err := packet.ChunkRoutes(family, withdraw, attrs, routes, encoding)
+	chunks, err := packet.ChunkRoutes(withdraw, attrs, routes, encoding)
 	if err != nil {
 		return timing.Timestamp{}, 0, err
 	}
@@ -103,7 +127,7 @@ func (f *fsm) writeUpdates(family bgp.Family, withdraw bool, attrs packet.PathAt
 	var firstTs timing.Timestamp
 	total := 0
 	for i, chunk := range chunks {
-		msg, err := packet.BuildUpdateMessage(family, withdraw, attrs, chunk, encoding)
+		msg, err := packet.BuildUpdateMessage(withdraw, attrs, chunk, encoding)
 		if err != nil {
 			return firstTs, total, err
 		}

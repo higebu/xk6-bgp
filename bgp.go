@@ -422,7 +422,7 @@ func (p *Peer) parseAdvertiseArg(rt *sobek.Runtime, arg sobek.Value, withdraw bo
 		}
 	}
 
-	routes, err := parseRoutesArray(rt, obj.Get("routes"))
+	routes, err := parseRoutesArray(rt, fam, obj.Get("routes"))
 	if err != nil {
 		return peer.AdvertiseRequest{}, err
 	}
@@ -448,8 +448,10 @@ func (p *Peer) parseAdvertiseArg(rt *sobek.Runtime, arg sobek.Value, withdraw bo
 // materialize a []any of len(arr) plus a Go string (or map[string]any)
 // per element, which dominates the JS↔Go boundary cost when COUNT runs
 // into the tens of thousands. Each element may be either a bare
-// prefix string or an object with {prefix}.
-func parseRoutesArray(rt *sobek.Runtime, v sobek.Value) ([]packet.Route, error) {
+// prefix string or an object with {prefix}. family selects which
+// packet.Route constructor to use (currently IPv4/IPv6 unicast via
+// packet.NewIPRoute); per-family dispatch grows here as new SAFIs land.
+func parseRoutesArray(rt *sobek.Runtime, family gobgp.Family, v sobek.Value) ([]packet.Route, error) {
 	if common.IsNullish(v) {
 		return nil, errors.New("routes is required and must be a non-empty array")
 	}
@@ -471,29 +473,52 @@ func parseRoutesArray(rt *sobek.Runtime, v sobek.Value) ([]packet.Route, error) 
 		if elem == nil || common.IsNullish(elem) {
 			return nil, fmt.Errorf("routes[%d]: nullish entry", i)
 		}
-		if isStringValue(elem) {
-			pref, err := netip.ParsePrefix(elem.String())
-			if err != nil {
-				return nil, fmt.Errorf("routes[%d]: %w", i, err)
-			}
-			routes[i] = packet.Route{Prefix: pref}
-			continue
-		}
-		eobj := elem.ToObject(rt)
-		if eobj == nil {
-			return nil, fmt.Errorf("routes[%d]: expected string or object", i)
-		}
-		pv := eobj.Get("prefix")
-		if common.IsNullish(pv) {
-			return nil, fmt.Errorf("routes[%d]: missing prefix", i)
-		}
-		pref, err := netip.ParsePrefix(pv.String())
+		r, err := parseRoute(rt, family, elem)
 		if err != nil {
 			return nil, fmt.Errorf("routes[%d]: %w", i, err)
 		}
-		routes[i] = packet.Route{Prefix: pref}
+		routes[i] = r
 	}
 	return routes, nil
+}
+
+// parseRoute converts one JS element into a packet.Route. Bare prefix
+// strings and {prefix: "..."} objects are both accepted. The family
+// argument selects the per-SAFI constructor; for IPv4/IPv6 unicast it
+// routes to packet.NewIPRoute.
+func parseRoute(rt *sobek.Runtime, family gobgp.Family, elem sobek.Value) (packet.Route, error) {
+	if isStringValue(elem) {
+		pref, err := netip.ParsePrefix(elem.String())
+		if err != nil {
+			return nil, err
+		}
+		return newRouteForFamily(family, pref)
+	}
+	eobj := elem.ToObject(rt)
+	if eobj == nil {
+		return nil, errors.New("expected string or object")
+	}
+	pv := eobj.Get("prefix")
+	if common.IsNullish(pv) {
+		return nil, errors.New("missing prefix")
+	}
+	pref, err := netip.ParsePrefix(pv.String())
+	if err != nil {
+		return nil, err
+	}
+	return newRouteForFamily(family, pref)
+}
+
+// newRouteForFamily picks the packet.Route constructor for the family.
+// Only IPv4/IPv6 unicast are wired today; add new cases when adding a
+// SAFI (MUP, VPN, EVPN, ...).
+func newRouteForFamily(family gobgp.Family, pref netip.Prefix) (packet.Route, error) {
+	switch family {
+	case gobgp.RF_IPv4_UC, gobgp.RF_IPv6_UC:
+		return packet.NewIPRoute(family, pref)
+	default:
+		return nil, fmt.Errorf("family %s is not supported for prefix-only route input", family)
+	}
 }
 
 // isStringValue reports whether v carries a JS string primitive

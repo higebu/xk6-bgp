@@ -321,7 +321,7 @@ func TestFSM_PeerDisconnectAfterEstablished(t *testing.T) {
 			NextHop: netip.MustParseAddr("10.0.0.1"),
 			LocalAS: 65001,
 		},
-		Routes: []packet.Route{{Prefix: netip.MustParsePrefix("10.100.0.0/24")}},
+		Routes: []packet.Route{packet.MustIPRoute(bgp.RF_IPv4_UC, netip.MustParsePrefix("10.100.0.0/24"))},
 	})
 	if !errors.Is(err, ErrSessionNotReady) {
 		t.Fatalf("Advertise after peer FIN returned %v, want ErrSessionNotReady", err)
@@ -393,7 +393,7 @@ func TestFSM_AdvertiseBeforeEstablishedRejected(t *testing.T) {
 			NextHop: netip.MustParseAddr("10.0.0.1"),
 			LocalAS: 65001,
 		},
-		Routes: []packet.Route{{Prefix: netip.MustParsePrefix("10.100.0.0/24")}},
+		Routes: []packet.Route{packet.MustIPRoute(bgp.RF_IPv4_UC, netip.MustParsePrefix("10.100.0.0/24"))},
 	})
 	if !errors.Is(err, ErrSessionNotReady) {
 		t.Fatalf("expected ErrSessionNotReady, got %v", err)

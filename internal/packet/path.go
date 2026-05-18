@@ -8,8 +8,25 @@ import (
 	bgp "github.com/osrg/gobgp/v4/pkg/packet/bgp"
 )
 
-type Route struct {
-	Prefix netip.Prefix
+// Route is a single family-specific NLRI input to BuildUpdateMessage
+// and ChunkRoutes. Each AFI/SAFI ships its own concrete Route type so
+// per-family validation and JS-shape conversion stay close to the wire
+// encoding rather than leaking into the generic encoder. The family is
+// authoritative — BuildUpdateMessage derives the message family from
+// the first route and rejects mixed families.
+type Route interface {
+	// Family returns the AFI/SAFI this route belongs to.
+	Family() bgp.Family
+	// NLRI returns the gobgp NLRI ready to be embedded in the UPDATE
+	// NLRI / Withdrawn-Routes / MP_REACH_NLRI / MP_UNREACH_NLRI
+	// fields. Construction-time errors are surfaced by the concrete
+	// type's constructor; NLRI itself must be allocation-free.
+	NLRI() bgp.NLRI
+	// WireLen returns the byte length of NLRI on the wire (length
+	// octet + prefix bytes for IP-prefix families, or the equivalent
+	// for variable-length NLRI such as MUP / EVPN). ChunkRoutes uses
+	// it to pack routes greedily into BGP_MAX_MESSAGE_LENGTH chunks.
+	WireLen() int
 }
 
 type PathAttrs struct {
@@ -45,18 +62,24 @@ type EncodingOptions struct {
 // size when Extended Messages has been negotiated by both peers.
 const BGPExtendedMaxMessageLength = 65535
 
-// BuildUpdateMessage encodes a single UPDATE. IPv4 unicast is carried
+// BuildUpdateMessage encodes a single UPDATE. The family is taken from
+// routes[0]; all routes must share that family. IPv4 unicast is carried
 // in the UPDATE's own NLRI / Withdrawn-Routes fields per RFC 4271 by
 // default; every other AFI/SAFI is carried in MP_REACH_NLRI /
 // MP_UNREACH_NLRI per RFC 4760. Set
 // EncodingOptions.UseMpReachForIPv4Unicast to override IPv4 unicast.
-func BuildUpdateMessage(family bgp.Family, withdraw bool, attrs PathAttrs, routes []Route, opts EncodingOptions) (*bgp.BGPMessage, error) {
+func BuildUpdateMessage(withdraw bool, attrs PathAttrs, routes []Route, opts EncodingOptions) (*bgp.BGPMessage, error) {
 	if len(routes) == 0 {
 		return nil, errors.New("UPDATE requires at least one route")
 	}
-	nlris, err := buildPathNLRIs(family, routes)
-	if err != nil {
-		return nil, err
+	family := routes[0].Family()
+	nlris := make([]bgp.PathNLRI, len(routes))
+	for i, r := range routes {
+		if r.Family() != family {
+			return nil, fmt.Errorf("routes[%d]: family %s does not match routes[0] family %s",
+				i, r.Family(), family)
+		}
+		nlris[i] = bgp.PathNLRI{NLRI: r.NLRI()}
 	}
 
 	if family.Afi() == bgp.AFI_IP && family.Safi() == bgp.SAFI_UNICAST && !opts.UseMpReachForIPv4Unicast {
@@ -148,27 +171,6 @@ func buildIPv4UnicastUpdate(withdraw bool, attrs PathAttrs, nlris []bgp.PathNLRI
 	return bgp.NewBGPUpdateMessage(nil, pa, nlris), nil
 }
 
-func buildPathNLRIs(family bgp.Family, routes []Route) ([]bgp.PathNLRI, error) {
-	out := make([]bgp.PathNLRI, 0, len(routes))
-	wantIPv6 := family.Afi() == bgp.AFI_IP6
-
-	for i, r := range routes {
-		if !r.Prefix.IsValid() {
-			return nil, fmt.Errorf("routes[%d]: invalid prefix", i)
-		}
-		gotIPv6 := r.Prefix.Addr().Is6() && !r.Prefix.Addr().Is4In6()
-		if gotIPv6 != wantIPv6 {
-			return nil, fmt.Errorf("routes[%d]: prefix %s does not match family %s", i, r.Prefix, family)
-		}
-		nlri, err := bgp.NewIPAddrPrefix(r.Prefix)
-		if err != nil {
-			return nil, fmt.Errorf("routes[%d]: %w", i, err)
-		}
-		out = append(out, bgp.PathNLRI{NLRI: nlri})
-	}
-	return out, nil
-}
-
 // SerializeMessage encodes a BGPMessage onto the packet. With Extended
 // Messages negotiated (RFC 8654), an UPDATE may exceed gobgp's
 // hard-coded 4096-byte ceiling in BGPMessage.Serialize; pre-set
@@ -191,22 +193,16 @@ func SerializeMessage(msg *bgp.BGPMessage, opts EncodingOptions) ([]byte, error)
 	return msg.Serialize()
 }
 
-// nlriWireSize returns the byte length of a single NLRI on the wire
-// for the IP-unicast families.
-func nlriWireSize(r Route) int {
-	return 1 + (int(r.Prefix.Bits())+7)/8
-}
-
 // ChunkRoutes splits routes into the largest possible sub-slices such
 // that each chunk, when built into a single UPDATE with the same
-// (family, withdraw, attrs), serializes within BGP_MAX_MESSAGE_LENGTH.
-// It does so by computing the path-attribute overhead once and packing
-// NLRIs greedily.
-func ChunkRoutes(family bgp.Family, withdraw bool, attrs PathAttrs, routes []Route, opts EncodingOptions) ([][]Route, error) {
+// (withdraw, attrs), serializes within BGP_MAX_MESSAGE_LENGTH. It does
+// so by computing the path-attribute overhead once and packing NLRIs
+// greedily using Route.WireLen().
+func ChunkRoutes(withdraw bool, attrs PathAttrs, routes []Route, opts EncodingOptions) ([][]Route, error) {
 	if len(routes) == 0 {
 		return nil, nil
 	}
-	overhead, err := shellOverhead(family, withdraw, attrs, routes[0], opts)
+	overhead, err := shellOverhead(withdraw, attrs, routes[0], opts)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +219,7 @@ func ChunkRoutes(family bgp.Family, withdraw bool, attrs PathAttrs, routes []Rou
 	var chunks [][]Route
 	start, used := 0, 0
 	for i, r := range routes {
-		sz := nlriWireSize(r)
+		sz := r.WireLen()
 		if sz > budget {
 			return nil, fmt.Errorf("routes[%d]: NLRI size %dB exceeds per-message budget %dB", i, sz, budget)
 		}
@@ -243,8 +239,8 @@ func ChunkRoutes(family bgp.Family, withdraw bool, attrs PathAttrs, routes []Rou
 // "probe" route is used to compute and subtract its NLRI wire length
 // because gobgp's serializer needs at least one NLRI to encode the
 // MP attribute.
-func shellOverhead(family bgp.Family, withdraw bool, attrs PathAttrs, probe Route, opts EncodingOptions) (int, error) {
-	msg, err := BuildUpdateMessage(family, withdraw, attrs, []Route{probe}, opts)
+func shellOverhead(withdraw bool, attrs PathAttrs, probe Route, opts EncodingOptions) (int, error) {
+	msg, err := BuildUpdateMessage(withdraw, attrs, []Route{probe}, opts)
 	if err != nil {
 		return 0, err
 	}
@@ -252,5 +248,5 @@ func shellOverhead(family bgp.Family, withdraw bool, attrs PathAttrs, probe Rout
 	if err != nil {
 		return 0, err
 	}
-	return len(body) - nlriWireSize(probe), nil
+	return len(body) - probe.WireLen(), nil
 }

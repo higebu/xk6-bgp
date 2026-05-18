@@ -6,6 +6,9 @@ import (
 	"testing"
 
 	"github.com/grafana/sobek"
+	gobgp "github.com/osrg/gobgp/v4/pkg/packet/bgp"
+
+	"github.com/higebu/xk6-bgp/internal/packet"
 )
 
 func newRT(t testing.TB) *sobek.Runtime {
@@ -22,21 +25,46 @@ func evalArray(t testing.TB, rt *sobek.Runtime, src string) sobek.Value {
 	return v
 }
 
+// ipPrefix extracts the prefix from a packet.Route, asserting it is an
+// IPRoute. Use only in tests that construct IP unicast routes.
+func ipPrefix(t testing.TB, r packet.Route) string {
+	t.Helper()
+	ipr, ok := r.(packet.IPRoute)
+	if !ok {
+		t.Fatalf("expected packet.IPRoute, got %T", r)
+	}
+	return ipr.Prefix().String()
+}
+
 func TestParseRoutesArray_StringForm(t *testing.T) {
 	rt := newRT(t)
-	arr := evalArray(t, rt, `["10.0.0.0/24", "10.0.1.0/24", "2001:db8::/32"]`)
-	got, err := parseRoutesArray(rt, arr)
+	// Family-mixed inputs require two passes: parseRoutesArray takes a
+	// single family per call.
+	arr4 := evalArray(t, rt, `["10.0.0.0/24", "10.0.1.0/24"]`)
+	got4, err := parseRoutesArray(rt, gobgp.RF_IPv4_UC, arr4)
 	if err != nil {
-		t.Fatalf("parseRoutesArray: %v", err)
+		t.Fatalf("parseRoutesArray v4: %v", err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("len=%d, want 3", len(got))
+	wantV4 := []string{"10.0.0.0/24", "10.0.1.0/24"}
+	if len(got4) != len(wantV4) {
+		t.Fatalf("v4 len=%d, want %d", len(got4), len(wantV4))
 	}
-	wantPrefixes := []string{"10.0.0.0/24", "10.0.1.0/24", "2001:db8::/32"}
-	for i, want := range wantPrefixes {
-		if got[i].Prefix.String() != want {
-			t.Errorf("routes[%d].Prefix=%s, want %s", i, got[i].Prefix, want)
+	for i, want := range wantV4 {
+		if p := ipPrefix(t, got4[i]); p != want {
+			t.Errorf("v4 routes[%d]=%s, want %s", i, p, want)
 		}
+	}
+
+	arr6 := evalArray(t, rt, `["2001:db8::/32"]`)
+	got6, err := parseRoutesArray(rt, gobgp.RF_IPv6_UC, arr6)
+	if err != nil {
+		t.Fatalf("parseRoutesArray v6: %v", err)
+	}
+	if len(got6) != 1 {
+		t.Fatalf("v6 len=%d, want 1", len(got6))
+	}
+	if p := ipPrefix(t, got6[0]); p != "2001:db8::/32" {
+		t.Errorf("v6 routes[0]=%s, want 2001:db8::/32", p)
 	}
 }
 
@@ -44,18 +72,17 @@ func TestParseRoutesArray_ObjectForm(t *testing.T) {
 	rt := newRT(t)
 	arr := evalArray(t, rt, `[
 		{prefix: "10.0.0.0/24"},
-		{prefix: "10.0.1.0/24"},
-		{prefix: "2001:db8::/32"}
+		{prefix: "10.0.1.0/24"}
 	]`)
-	got, err := parseRoutesArray(rt, arr)
+	got, err := parseRoutesArray(rt, gobgp.RF_IPv4_UC, arr)
 	if err != nil {
 		t.Fatalf("parseRoutesArray: %v", err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("len=%d, want 3", len(got))
+	if len(got) != 2 {
+		t.Fatalf("len=%d, want 2", len(got))
 	}
-	if got[0].Prefix.String() != "10.0.0.0/24" {
-		t.Errorf("got[0].Prefix=%s, want 10.0.0.0/24", got[0].Prefix)
+	if p := ipPrefix(t, got[0]); p != "10.0.0.0/24" {
+		t.Errorf("got[0]=%s, want 10.0.0.0/24", p)
 	}
 }
 
@@ -72,11 +99,12 @@ func TestParseRoutesArray_Errors(t *testing.T) {
 		{"missingPrefix", `[{}]`, "missing prefix"},
 		{"nullEntry", `[null]`, "routes[0]"},
 		{"numberEntry", `[42]`, "routes[0]"},
+		{"familyMismatch", `["2001:db8::/32"]`, "does not match"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			arr := evalArray(t, rt, tc.src)
-			_, err := parseRoutesArray(rt, arr)
+			_, err := parseRoutesArray(rt, gobgp.RF_IPv4_UC, arr)
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tc.want)
 			}
@@ -103,19 +131,20 @@ func TestParseRoutesArray_LargeStringList(t *testing.T) {
 	}
 	sb.WriteByte(']')
 	arr := evalArray(t, rt, sb.String())
-	got, err := parseRoutesArray(rt, arr)
+	got, err := parseRoutesArray(rt, gobgp.RF_IPv4_UC, arr)
 	if err != nil {
 		t.Fatalf("parseRoutesArray: %v", err)
 	}
 	if len(got) != n {
 		t.Fatalf("len=%d, want %d", len(got), n)
 	}
-	// Spot-check the first, last, and a middle entry.
-	if got[0].Prefix.String() != "10.0.0.0/32" {
-		t.Errorf("got[0]=%s, want 10.0.0.0/32", got[0].Prefix)
+	// Spot-check the first and last entry.
+	if p := ipPrefix(t, got[0]); p != "10.0.0.0/32" {
+		t.Errorf("got[0]=%s, want 10.0.0.0/32", p)
 	}
-	if got[n-1].Prefix.String() != fmt.Sprintf("10.%d.%d.%d/32", ((n-1)>>16)&0xff, ((n-1)>>8)&0xff, (n-1)&0xff) {
-		t.Errorf("got[last]=%s, mismatch", got[n-1].Prefix)
+	want := fmt.Sprintf("10.%d.%d.%d/32", ((n-1)>>16)&0xff, ((n-1)>>8)&0xff, (n-1)&0xff)
+	if p := ipPrefix(t, got[n-1]); p != want {
+		t.Errorf("got[last]=%s, want %s", p, want)
 	}
 }
 
@@ -222,7 +251,7 @@ func BenchmarkParseRoutesArray_String10k(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if _, err := parseRoutesArray(rt, arr); err != nil {
+		if _, err := parseRoutesArray(rt, gobgp.RF_IPv4_UC, arr); err != nil {
 			b.Fatal(err)
 		}
 	}

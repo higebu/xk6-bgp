@@ -66,15 +66,15 @@ func TestFSMDispatchExtractsMPNLRI(t *testing.T) {
 	f := newFSM(cfg)
 
 	msg, err := packet.BuildUpdateMessage(
-		bgp.RF_IPv4_UC, false,
+		false,
 		packet.PathAttrs{
 			Origin:  0,
 			NextHop: netip.MustParseAddr("192.0.2.1"),
 			LocalAS: 65001,
 		},
 		[]packet.Route{
-			{Prefix: netip.MustParsePrefix("203.0.113.0/24")},
-			{Prefix: netip.MustParsePrefix("198.51.100.0/24")},
+			packet.MustIPRoute(bgp.RF_IPv4_UC, netip.MustParsePrefix("203.0.113.0/24")),
+			packet.MustIPRoute(bgp.RF_IPv4_UC, netip.MustParsePrefix("198.51.100.0/24")),
 		},
 		packet.EncodingOptions{},
 	)
@@ -119,15 +119,15 @@ func TestFSMDispatchExtractsIPv6MPNLRI(t *testing.T) {
 	f := newFSM(cfg)
 
 	msg, err := packet.BuildUpdateMessage(
-		bgp.RF_IPv6_UC, false,
+		false,
 		packet.PathAttrs{
 			Origin:  0,
 			NextHop: netip.MustParseAddr("2001:db8::1"),
 			LocalAS: 65001,
 		},
 		[]packet.Route{
-			{Prefix: netip.MustParsePrefix("2001:db8:a::/48")},
-			{Prefix: netip.MustParsePrefix("2001:db8:b::/48")},
+			packet.MustIPRoute(bgp.RF_IPv6_UC, netip.MustParsePrefix("2001:db8:a::/48")),
+			packet.MustIPRoute(bgp.RF_IPv6_UC, netip.MustParsePrefix("2001:db8:b::/48")),
 		},
 		packet.EncodingOptions{},
 	)

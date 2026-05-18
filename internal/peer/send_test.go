@@ -34,7 +34,7 @@ func TestAdvertise_RejectsExtendedWithoutNegotiation(t *testing.T) {
 	_, err := p.Advertise(AdvertiseRequest{
 		Family: bgp.RF_IPv4_UC,
 		Attrs:  packet.PathAttrs{NextHop: netip.MustParseAddr("10.0.0.1"), LocalAS: 65001},
-		Routes: []packet.Route{{Prefix: netip.MustParsePrefix("10.0.0.0/24")}},
+		Routes: []packet.Route{packet.MustIPRoute(bgp.RF_IPv4_UC, netip.MustParsePrefix("10.0.0.0/24"))},
 		Encoding: packet.EncodingOptions{
 			UseExtendedMessages: true,
 		},
@@ -70,10 +70,9 @@ func TestWriteUpdatesChunking(t *testing.T) {
 	const n = 2000
 	routes := make([]packet.Route, 0, n)
 	for i := 0; i < n; i++ {
-		routes = append(routes, packet.Route{
-			Prefix: netip.MustParsePrefix(fmt.Sprintf("10.%d.%d.%d/32",
-				(i>>16)&0xff, (i>>8)&0xff, i&0xff)),
-		})
+		routes = append(routes, packet.MustIPRoute(bgp.RF_IPv4_UC,
+			netip.MustParsePrefix(fmt.Sprintf("10.%d.%d.%d/32",
+				(i>>16)&0xff, (i>>8)&0xff, i&0xff))))
 	}
 
 	got := atomic.Int64{}
@@ -97,7 +96,7 @@ func TestWriteUpdatesChunking(t *testing.T) {
 		LocalAS: 65001,
 	}
 
-	ts, sent, err := f.writeUpdates(bgp.RF_IPv4_UC, false, attrs, routes, packet.EncodingOptions{}, 0.0)
+	ts, sent, err := f.writeUpdates(false, attrs, routes, packet.EncodingOptions{}, 0.0)
 	if err != nil {
 		t.Fatalf("writeUpdates: %v", err)
 	}
