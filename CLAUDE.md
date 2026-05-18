@@ -8,15 +8,9 @@ FSM and TCP I/O loop are xk6-bgp's own.
 
 ## Ground rules
 
-- Respond to the user in Japanese
-- Insert a half-width space between full-width and half-width characters
-  in Japanese text
 - No emojis
 - RFC compliance is the top priority
 - Do not write unnecessary comments
-- Comments are written in English
-- Log messages are written in English
-- Error messages are written in English
 
 ## Review
 
@@ -29,7 +23,6 @@ FSM and TCP I/O loop are xk6-bgp's own.
 
 - Do not commit on your own
 - Confirm the commit message with the user
-- Commit messages are written in English
 - Commit messages use the imperative mood
 - One concern per commit
 - Force-push only with `--force-with-lease`
