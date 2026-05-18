@@ -198,14 +198,14 @@ func TestParsePrefixList_Errors(t *testing.T) {
 			want: "non-empty",
 		},
 		{
-			name: "nonString",
+			name: "numberEntry",
 			setup: func() *sobek.Object {
 				o := rt.NewObject()
 				v, _ := rt.RunString(`[123]`)
 				_ = o.Set("prefixes", v)
 				return o
 			},
-			want: "prefixes[0] must be a string",
+			want: "missing type",
 		},
 		{
 			name: "badPrefix",
@@ -228,6 +228,103 @@ func TestParsePrefixList_Errors(t *testing.T) {
 				t.Errorf("error %q does not contain %q", err.Error(), tc.want)
 			}
 		})
+	}
+}
+
+func TestParseRoutesArray_MUP(t *testing.T) {
+	rt := newRT(t)
+	arr := evalArray(t, rt, `[
+		{ type: 'isd',  rd: '65000:1', prefix: '10.10.10.0/24' },
+		{ type: 'dsd',  rd: '65000:1', address: '10.10.10.1' },
+		{ type: 't1st', rd: '65000:1', prefix: '192.0.2.0/24', teid: '0.0.0.100', qfi: 9, endpoint: '10.10.10.1' },
+		{ type: 't1st', rd: '65000:1', prefix: '192.0.2.0/24', teid: '0.0.0.100', qfi: 9, endpoint: '10.10.10.1', source: '10.10.10.2' },
+		{ type: 't2st', rd: '65000:1', endpoint: '10.10.10.1', endpointAddressLength: 64, teid: '0.0.0.100' }
+	]`)
+	got, err := parseRoutesArray(rt, gobgp.RF_MUP_IPv4, arr)
+	if err != nil {
+		t.Fatalf("parseRoutesArray: %v", err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("len=%d, want 5", len(got))
+	}
+	wantKeys := []string{
+		"[type:isd][rd:65000:1][prefix:10.10.10.0/24]",
+		"[type:dsd][rd:65000:1][prefix:10.10.10.1]",
+		"[type:t1st][rd:65000:1][prefix:192.0.2.0/24]",
+		"[type:t1st][rd:65000:1][prefix:192.0.2.0/24]",
+		"[type:t2st][rd:65000:1][endpoint-address-length:64][endpoint:10.10.10.1][teid:0.0.0.100]",
+	}
+	for i, want := range wantKeys {
+		mr, ok := got[i].(packet.MUPRoute)
+		if !ok {
+			t.Fatalf("routes[%d] is %T, want MUPRoute", i, got[i])
+		}
+		if mr.Key() != want {
+			t.Errorf("routes[%d].Key=%s, want %s", i, mr.Key(), want)
+		}
+	}
+}
+
+func TestParseRoutesArray_MUPErrors(t *testing.T) {
+	rt := newRT(t)
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"bareStringNotAllowed", `["10.0.0.0/24"]`, "must be an object"},
+		{"missingType", `[{ rd: '65000:1', prefix: '10.0.0.0/24' }]`, "missing type"},
+		{"unknownType", `[{ type: 'foo', rd: '65000:1' }]`, "unknown mup route type"},
+		{"missingRD", `[{ type: 'isd', prefix: '10.0.0.0/24' }]`, "missing rd"},
+		{"missingPrefix", `[{ type: 'isd', rd: '65000:1' }]`, "missing prefix"},
+		{"missingAddress", `[{ type: 'dsd', rd: '65000:1' }]`, "missing address"},
+		{"t2stMissingEAL", `[{ type: 't2st', rd: '65000:1', endpoint: '10.0.0.1', teid: '0.0.0.1' }]`, "endpointAddressLength"},
+		{"t1stIPv6TEID", `[{ type: 't1st', rd: '65000:1', prefix: '10.0.0.1/32', teid: '::1', qfi: 9, endpoint: '10.0.0.1' }]`, "teid must be an IPv4-shaped"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			arr := evalArray(t, rt, tc.src)
+			_, err := parseRoutesArray(rt, gobgp.RF_MUP_IPv4, arr)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+func TestParsePrefixList_MUPDescriptors(t *testing.T) {
+	rt := newRT(t)
+	obj := rt.NewObject()
+	arr, err := rt.RunString(`[
+		{ type: 'isd', rd: '65000:1', prefix: '10.10.10.0/24' },
+		{ type: 'dsd', rd: '65000:1', address: '2001:db8::1' },
+		'10.0.0.0/24'
+	]`)
+	if err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if err := obj.Set("prefixes", arr); err != nil {
+		t.Fatalf("set prefixes: %v", err)
+	}
+	got, err := parsePrefixList(rt, obj)
+	if err != nil {
+		t.Fatalf("parsePrefixList: %v", err)
+	}
+	want := []string{
+		"[type:isd][rd:65000:1][prefix:10.10.10.0/24]",
+		"[type:dsd][rd:65000:1][prefix:2001:db8::1]",
+		"10.0.0.0/24",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len=%d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got[%d]=%s, want %s", i, got[i], want[i])
+		}
 	}
 }
 

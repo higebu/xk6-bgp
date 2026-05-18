@@ -333,11 +333,12 @@ func (p *Peer) WaitForPrefixes(arg sobek.Value) (sobek.Value, error) {
 }
 
 // parsePrefixList collects the user's prefix array and canonicalizes
-// each entry through netip so non-canonical IPv6 input (e.g.
-// "2001:0db8::/32") matches the observed-set keys, which use the
-// canonical form gobgp NLRI.String() emits. Like parseRoutesArray,
-// this walks the sobek Array directly to avoid the []any allocation
-// Value.Export() would do.
+// each entry into the gobgp NLRI.String() form so it matches the
+// observed-set keys recorded by the receive path. Bare strings are
+// treated as IP prefixes (IP unicast); object form is accepted for MUP
+// descriptors (same shape as advertise's routes — see parseMUPRoute).
+// Like parseRoutesArray, this walks the sobek Array directly to avoid
+// the []any allocation Value.Export() would do.
 func parsePrefixList(rt *sobek.Runtime, obj *sobek.Object) ([]string, error) {
 	pv := obj.Get("prefixes")
 	if common.IsNullish(pv) {
@@ -345,11 +346,11 @@ func parsePrefixList(rt *sobek.Runtime, obj *sobek.Object) ([]string, error) {
 	}
 	arr := pv.ToObject(rt)
 	if arr == nil {
-		return nil, errors.New("waitForPrefixes: prefixes must be an array of strings")
+		return nil, errors.New("waitForPrefixes: prefixes must be an array")
 	}
 	lenV := arr.Get("length")
 	if common.IsNullish(lenV) {
-		return nil, errors.New("waitForPrefixes: prefixes must be an array of strings")
+		return nil, errors.New("waitForPrefixes: prefixes must be an array")
 	}
 	n := int(lenV.ToInteger())
 	if n <= 0 {
@@ -361,16 +362,78 @@ func parsePrefixList(rt *sobek.Runtime, obj *sobek.Object) ([]string, error) {
 		if elem == nil || common.IsNullish(elem) {
 			return nil, fmt.Errorf("waitForPrefixes: prefixes[%d] is nullish", i)
 		}
-		if !isStringValue(elem) {
-			return nil, fmt.Errorf("waitForPrefixes: prefixes[%d] must be a string", i)
+		if isStringValue(elem) {
+			pref, err := netip.ParsePrefix(elem.String())
+			if err != nil {
+				return nil, fmt.Errorf("waitForPrefixes: prefixes[%d]: %w", i, err)
+			}
+			out[i] = pref.String()
+			continue
 		}
-		pref, err := netip.ParsePrefix(elem.String())
+		eobj := elem.ToObject(rt)
+		if eobj == nil {
+			return nil, fmt.Errorf("waitForPrefixes: prefixes[%d] must be a string or object", i)
+		}
+		key, err := mupDescriptorKey(eobj)
 		if err != nil {
 			return nil, fmt.Errorf("waitForPrefixes: prefixes[%d]: %w", i, err)
 		}
-		out[i] = pref.String()
+		out[i] = key
 	}
 	return out, nil
+}
+
+// mupDescriptorKey turns a MUP route descriptor into the canonical
+// gobgp NLRI.String() form, which is the key used by the receive side
+// observed-set. The family AFI is auto-derived from the descriptor's
+// contained prefix/address so JS callers do not need to repeat it.
+func mupDescriptorKey(obj *sobek.Object) (string, error) {
+	rt := optString(obj, "type")
+	if rt == "" {
+		return "", errors.New("mup descriptor missing type")
+	}
+	// Pick an arbitrary MUP family for construction; the resulting
+	// NLRI.String() never embeds the AFI/SAFI, so it is family-agnostic
+	// once we pass the per-type validation in the constructors.
+	var family gobgp.Family
+	switch rt {
+	case packet.MUPTypeISD, packet.MUPTypeT1ST:
+		p, err := requirePrefix(obj, "prefix")
+		if err != nil {
+			return "", err
+		}
+		family = mupFamilyForAddr(p.Addr())
+	case packet.MUPTypeDSD:
+		a, err := requireAddr(obj, "address")
+		if err != nil {
+			return "", err
+		}
+		family = mupFamilyForAddr(a)
+	case packet.MUPTypeT2ST:
+		a, err := requireAddr(obj, "endpoint")
+		if err != nil {
+			return "", err
+		}
+		family = mupFamilyForAddr(a)
+	default:
+		return "", fmt.Errorf("unknown mup route type %q", rt)
+	}
+	r, err := parseMUPRoute(family, obj)
+	if err != nil {
+		return "", err
+	}
+	mr, ok := r.(packet.MUPRoute)
+	if !ok {
+		return "", fmt.Errorf("internal: parseMUPRoute returned %T", r)
+	}
+	return mr.Key(), nil
+}
+
+func mupFamilyForAddr(a netip.Addr) gobgp.Family {
+	if a.Is6() && !a.Is4In6() {
+		return gobgp.RF_MUP_IPv6
+	}
+	return gobgp.RF_MUP_IPv4
 }
 
 func resultToJS(rt *sobek.Runtime, r peer.AdvertiseResult) sobek.Value {
@@ -482,11 +545,22 @@ func parseRoutesArray(rt *sobek.Runtime, family gobgp.Family, v sobek.Value) ([]
 	return routes, nil
 }
 
-// parseRoute converts one JS element into a packet.Route. Bare prefix
-// strings and {prefix: "..."} objects are both accepted. The family
-// argument selects the per-SAFI constructor; for IPv4/IPv6 unicast it
-// routes to packet.NewIPRoute.
+// parseRoute converts one JS element into a packet.Route. For IP
+// unicast families a bare prefix string or {prefix: "..."} object is
+// accepted. For MUP families the element must be an object whose
+// `type` discriminates the route type (isd/dsd/t1st/t2st); see
+// parseMUPRoute.
 func parseRoute(rt *sobek.Runtime, family gobgp.Family, elem sobek.Value) (packet.Route, error) {
+	if family.Safi() == gobgp.SAFI_MUP {
+		if isStringValue(elem) {
+			return nil, errors.New("mup route must be an object with a type field")
+		}
+		eobj := elem.ToObject(rt)
+		if eobj == nil {
+			return nil, errors.New("expected mup route object")
+		}
+		return parseMUPRoute(family, eobj)
+	}
 	if isStringValue(elem) {
 		pref, err := netip.ParsePrefix(elem.String())
 		if err != nil {
@@ -519,6 +593,113 @@ func newRouteForFamily(family gobgp.Family, pref netip.Prefix) (packet.Route, er
 	default:
 		return nil, fmt.Errorf("family %s is not supported for prefix-only route input", family)
 	}
+}
+
+// parseMUPRoute converts a JS MUP route descriptor into a packet.Route.
+// Field shapes per draft-mpmz-bess-mup-safi-03 sections 3.1.1-3.1.4:
+//
+//	{ type: 'isd',  rd: '65000:1', prefix: '10.0.0.0/24' }
+//	{ type: 'dsd',  rd: '65000:1', address: '10.0.0.1' }
+//	{ type: 't1st', rd: '65000:1', prefix: '10.0.0.1/32', teid: '0.0.0.1', qfi: 9, endpoint: '10.0.0.1', source?: '10.0.0.99' }
+//	{ type: 't2st', rd: '65000:1', endpoint: '10.0.0.1', endpointAddressLength: 64, teid: '0.0.0.1' }
+func parseMUPRoute(family gobgp.Family, obj *sobek.Object) (packet.Route, error) {
+	rt := optString(obj, "type")
+	if rt == "" {
+		return nil, errors.New("missing type")
+	}
+	rd, err := parseRD(obj)
+	if err != nil {
+		return nil, err
+	}
+	switch rt {
+	case packet.MUPTypeISD:
+		pref, err := requirePrefix(obj, "prefix")
+		if err != nil {
+			return nil, err
+		}
+		return packet.NewMUPInterworkSegmentDiscoveryRoute(family, rd, pref)
+	case packet.MUPTypeDSD:
+		addr, err := requireAddr(obj, "address")
+		if err != nil {
+			return nil, err
+		}
+		return packet.NewMUPDirectSegmentDiscoveryRoute(family, rd, addr)
+	case packet.MUPTypeT1ST:
+		pref, err := requirePrefix(obj, "prefix")
+		if err != nil {
+			return nil, err
+		}
+		teid, err := requireAddr(obj, "teid")
+		if err != nil {
+			return nil, err
+		}
+		endpoint, err := requireAddr(obj, "endpoint")
+		if err != nil {
+			return nil, err
+		}
+		var source *netip.Addr
+		if v := obj.Get("source"); !common.IsNullish(v) {
+			s, err := netip.ParseAddr(v.String())
+			if err != nil {
+				return nil, fmt.Errorf("source: %w", err)
+			}
+			source = &s
+		}
+		qfi := uint8(optUint32(obj, "qfi")) // #nosec G115 -- QFI is a 6-bit field carried in one octet per draft-mpmz-bess-mup-safi-03 section 3.1.3
+		return packet.NewMUPType1SessionTransformedRoute(family, rd, pref, teid, qfi, endpoint, source)
+	case packet.MUPTypeT2ST:
+		endpoint, err := requireAddr(obj, "endpoint")
+		if err != nil {
+			return nil, err
+		}
+		teid, err := requireAddr(obj, "teid")
+		if err != nil {
+			return nil, err
+		}
+		eal := obj.Get("endpointAddressLength")
+		if common.IsNullish(eal) {
+			return nil, errors.New("missing endpointAddressLength")
+		}
+		return packet.NewMUPType2SessionTransformedRoute(family, rd, endpoint, uint8(eal.ToInteger()), teid) // #nosec G115 -- Endpoint Address Length is a 1-octet field per draft-mpmz-bess-mup-safi-03 section 3.1.4
+	default:
+		return nil, fmt.Errorf("unknown mup route type %q", rt)
+	}
+}
+
+func parseRD(obj *sobek.Object) (gobgp.RouteDistinguisherInterface, error) {
+	s := optString(obj, "rd")
+	if s == "" {
+		return nil, errors.New("missing rd")
+	}
+	rd, err := gobgp.ParseRouteDistinguisher(s)
+	if err != nil {
+		return nil, fmt.Errorf("rd: %w", err)
+	}
+	return rd, nil
+}
+
+func requirePrefix(obj *sobek.Object, key string) (netip.Prefix, error) {
+	v := obj.Get(key)
+	if common.IsNullish(v) {
+		return netip.Prefix{}, fmt.Errorf("missing %s", key)
+	}
+	p, err := netip.ParsePrefix(v.String())
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("%s: %w", key, err)
+	}
+	return p, nil
+}
+
+func requireAddr(obj *sobek.Object, key string) (netip.Addr, error) {
+	v := obj.Get(key)
+	if common.IsNullish(v) {
+		return netip.Addr{}, fmt.Errorf("missing %s", key)
+	}
+	a, err := netip.ParseAddr(v.String())
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("%s: %w", key, err)
+	}
+	return a, nil
 }
 
 // isStringValue reports whether v carries a JS string primitive

@@ -81,6 +81,7 @@ various scenarios:
 - [`smoke.js`](./examples/smoke.js) — minimal one-peer advertise/withdraw smoke test
 - [`ipv4_unicast.js`](./examples/ipv4_unicast.js) — IPv4-unicast UPDATE delivery between two Peers
 - [`ipv6_unicast.js`](./examples/ipv6_unicast.js) — IPv6-unicast variant
+- [`mup.js`](./examples/mup.js) — `ipv4-mup` advertise of all four MUP route types
 - [`throughput.js`](./examples/throughput.js) — single-peer advertise throughput sweep over `COUNT` prefixes
 - [`multi_peer.js`](./examples/multi_peer.js) — many-peer benchmark
 - [`session_up.js`](./examples/session_up.js) — `OPEN → Established` scaling under many concurrent peers
@@ -164,7 +165,7 @@ goroutine, so blocking in one VU does not block others.
 | `family` | string | AFI/SAFI declared in `peer.families` (required) |
 | `nextHop` | string | IPv4 or IPv6 next-hop (required for `advertise`) |
 | `localAs` | number | AS_PATH origin AS (required for `advertise`) |
-| `routes` | string[] \| object[] | Prefixes (e.g. `['10.0.0.0/24']`) or `{ prefix }` objects (required) |
+| `routes` | string[] \| object[] | For `ipv4-unicast` / `ipv6-unicast`: prefixes (e.g. `['10.0.0.0/24']`) or `{ prefix }` objects. For `ipv4-mup` / `ipv6-mup`: route descriptors keyed by `type` (see [MUP routes](#mup-routes)) (required) |
 | `origin` | number | ORIGIN attribute: `0` IGP, `1` EGP, `2` INCOMPLETE (`advertise` only, default `0`) |
 | `med` | number | MULTI_EXIT_DISC (`advertise` only) |
 | `localPref` | number | LOCAL_PREF for iBGP (`advertise` only) |
@@ -176,9 +177,28 @@ goroutine, so blocking in one VU does not block others.
 
 | Field | Type | Description |
 |---|---|---|
-| `prefixes` | string[] | Expected prefix set (required) |
+| `prefixes` | (string \| object)[] | Expected route set: prefix strings for IP unicast or MUP descriptor objects (same shape as `advertise.routes`) (required) |
 | `timeout` | string \| number | k6 duration string or seconds; throws if not met before this |
 | `sentAtMonoNs` | number | Filter observations that predate this mono-ns timestamp, and anchor the `bgp_prefix_received_duration` sample (typically `advertise.sentAtMonoNs`) |
+
+### MUP routes
+
+For the MUP SAFI (`ipv4-mup` / `ipv6-mup`, draft-mpmz-bess-mup-safi-03)
+the `routes` entries are objects with a `type` discriminator. The
+descriptors are shared between `advertise` / `withdraw` / `waitForPrefixes`.
+
+| `type` | Required fields | Optional fields | Reference |
+|---|---|---|---|
+| `'isd'`  | `rd`, `prefix` | — | section 3.1.1 |
+| `'dsd'`  | `rd`, `address` | — | section 3.1.2 |
+| `'t1st'` | `rd`, `prefix`, `teid`, `qfi`, `endpoint` | `source` | section 3.1.3 |
+| `'t2st'` | `rd`, `endpoint`, `endpointAddressLength`, `teid` | — | section 3.1.4 |
+
+`rd` accepts any RD form gobgp parses (`asn:n`, `asn.asn:n`, `ipv4:n`).
+`teid` is given as an IPv4-shaped dotted-quad to carry the 32-bit TEID
+(e.g. `'0.0.0.100'` for TEID 100). `endpointAddressLength` is the
+combined Endpoint Address + TEID bit length per the draft: 32..64 for
+IPv4 endpoints, 128..160 for IPv6.
 
 ### Cross-VU coordination
 
