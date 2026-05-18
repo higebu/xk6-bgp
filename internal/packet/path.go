@@ -35,6 +35,56 @@ type PathAttrs struct {
 	LocalAS   uint32
 	MED       *uint32
 	LocalPref *uint32 // iBGP only
+	// ExtCommunities, when non-empty, is emitted as a transitive
+	// EXTENDED_COMMUNITIES attribute (RFC 4360). Required for L3VPN
+	// route distribution where the receiver imports based on
+	// Route-Target ext-communities (RFC 4364 section 4.3.1).
+	ExtCommunities []bgp.ExtendedCommunityInterface
+	// SRv6L3Service, when non-nil, is emitted as a PathAttributePrefixSID
+	// holding a single SRv6 L3 Service TLV (RFC 9252). Shared by every
+	// NLRI in the UPDATE — the common "one SID per VRF" L3VPN deployment
+	// pattern. Per-prefix SID variation would need separate UPDATEs.
+	SRv6L3Service *SRv6L3ServiceConfig
+}
+
+// SRv6L3ServiceConfig describes the contents of an RFC 9252 SRv6 L3
+// Service TLV. The SID is signalled in full (no transposition), so the
+// MPLS Label field of the VPN NLRI must stay 0 and Transposition Length
+// / Offset stay 0. Locator Block + Node + Function + Argument lengths
+// describe the SID Structure Sub-Sub-TLV (RFC 9252 section 3.2.1) and
+// help the receiver decode the SID layout when it programs the dataplane.
+type SRv6L3ServiceConfig struct {
+	SID                 netip.Addr
+	EndpointBehavior    bgp.SRBehavior
+	LocatorBlockLength  uint8
+	LocatorNodeLength   uint8
+	FunctionLength      uint8
+	ArgumentLength      uint8
+	TranspositionLength uint8
+	TranspositionOffset uint8
+}
+
+func (c *SRv6L3ServiceConfig) buildAttr() (*bgp.PathAttributePrefixSID, error) {
+	if !c.SID.Is6() || c.SID.Is4In6() {
+		return nil, fmt.Errorf("srv6L3Service: sid %s is not a plain IPv6 address", c.SID)
+	}
+	return bgp.NewPathAttributePrefixSID(
+		bgp.NewSRv6ServiceTLV(
+			bgp.TLVTypeSRv6L3Service,
+			bgp.NewSRv6InformationSubTLV(
+				c.SID,
+				c.EndpointBehavior,
+				bgp.NewSRv6SIDStructureSubSubTLV(
+					c.LocatorBlockLength,
+					c.LocatorNodeLength,
+					c.FunctionLength,
+					c.ArgumentLength,
+					c.TranspositionLength,
+					c.TranspositionOffset,
+				),
+			),
+		),
+	), nil
 }
 
 // EncodingOptions tunes how BuildUpdateMessage / ChunkRoutes encode an
@@ -134,6 +184,16 @@ func BuildUpdateMessage(withdraw bool, attrs PathAttrs, routes []Route, opts Enc
 	if attrs.LocalPref != nil {
 		pa = append(pa, bgp.NewPathAttributeLocalPref(*attrs.LocalPref))
 	}
+	if len(attrs.ExtCommunities) > 0 {
+		pa = append(pa, bgp.NewPathAttributeExtendedCommunities(attrs.ExtCommunities))
+	}
+	if attrs.SRv6L3Service != nil {
+		psid, err := attrs.SRv6L3Service.buildAttr()
+		if err != nil {
+			return nil, err
+		}
+		pa = append(pa, psid)
+	}
 
 	return bgp.NewBGPUpdateMessage(nil, pa, nil), nil
 }
@@ -167,6 +227,16 @@ func buildIPv4UnicastUpdate(withdraw bool, attrs PathAttrs, nlris []bgp.PathNLRI
 	}
 	if attrs.LocalPref != nil {
 		pa = append(pa, bgp.NewPathAttributeLocalPref(*attrs.LocalPref))
+	}
+	if len(attrs.ExtCommunities) > 0 {
+		pa = append(pa, bgp.NewPathAttributeExtendedCommunities(attrs.ExtCommunities))
+	}
+	if attrs.SRv6L3Service != nil {
+		psid, err := attrs.SRv6L3Service.buildAttr()
+		if err != nil {
+			return nil, err
+		}
+		pa = append(pa, psid)
 	}
 	return bgp.NewBGPUpdateMessage(nil, pa, nlris), nil
 }
