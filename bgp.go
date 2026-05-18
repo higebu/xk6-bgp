@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/grafana/sobek"
@@ -374,13 +375,51 @@ func parsePrefixList(rt *sobek.Runtime, obj *sobek.Object) ([]string, error) {
 		if eobj == nil {
 			return nil, fmt.Errorf("waitForPrefixes: prefixes[%d] must be a string or object", i)
 		}
-		key, err := mupDescriptorKey(eobj)
+		key, err := descriptorKey(eobj)
 		if err != nil {
 			return nil, fmt.Errorf("waitForPrefixes: prefixes[%d]: %w", i, err)
 		}
 		out[i] = key
 	}
 	return out, nil
+}
+
+// descriptorKey routes a JS route-descriptor object to the per-family
+// canonicalizer that produces the gobgp NLRI.String() used as the
+// observed-set key. MUP descriptors carry a `type` discriminator;
+// L3VPN descriptors carry `rd` + `prefix`.
+func descriptorKey(obj *sobek.Object) (string, error) {
+	if !common.IsNullish(obj.Get("type")) {
+		return mupDescriptorKey(obj)
+	}
+	if !common.IsNullish(obj.Get("rd")) {
+		return vpnDescriptorKey(obj)
+	}
+	return "", errors.New("descriptor must carry either `type` (MUP) or `rd` (L3VPN)")
+}
+
+// vpnDescriptorKey turns an L3VPN route descriptor into the canonical
+// gobgp LabeledVPNIPAddrPrefix.String() form ("<rd>:<prefix>"). The
+// family AFI is auto-derived from the prefix because the receive side
+// keys by NLRI.String(), which never embeds the AFI/SAFI.
+func vpnDescriptorKey(obj *sobek.Object) (string, error) {
+	pref, err := requirePrefix(obj, "prefix")
+	if err != nil {
+		return "", err
+	}
+	family := gobgp.RF_IPv4_VPN
+	if pref.Addr().Is6() && !pref.Addr().Is4In6() {
+		family = gobgp.RF_IPv6_VPN
+	}
+	r, err := parseVPNIPRoute(family, obj)
+	if err != nil {
+		return "", err
+	}
+	vr, ok := r.(packet.VPNIPRoute)
+	if !ok {
+		return "", fmt.Errorf("internal: parseVPNIPRoute returned %T", r)
+	}
+	return vr.Key(), nil
 }
 
 // mupDescriptorKey turns a MUP route descriptor into the canonical
@@ -483,6 +522,20 @@ func (p *Peer) parseAdvertiseArg(rt *sobek.Runtime, arg sobek.Value, withdraw bo
 			lp := uint32(v.ToInteger()) // #nosec G115 -- LOCAL_PREF is a 4-octet field per RFC 4271 section 5.1.5
 			attrs.LocalPref = &lp
 		}
+		if v := obj.Get("extCommunities"); !common.IsNullish(v) {
+			ecs, err := parseExtCommunities(rt, v)
+			if err != nil {
+				return peer.AdvertiseRequest{}, fmt.Errorf("extCommunities: %w", err)
+			}
+			attrs.ExtCommunities = ecs
+		}
+		if v := obj.Get("srv6L3Service"); !common.IsNullish(v) {
+			cfg, err := parseSRv6L3Service(rt, v)
+			if err != nil {
+				return peer.AdvertiseRequest{}, fmt.Errorf("srv6L3Service: %w", err)
+			}
+			attrs.SRv6L3Service = cfg
+		}
 	}
 
 	routes, err := parseRoutesArray(rt, fam, obj.Get("routes"))
@@ -549,7 +602,8 @@ func parseRoutesArray(rt *sobek.Runtime, family gobgp.Family, v sobek.Value) ([]
 // unicast families a bare prefix string or {prefix: "..."} object is
 // accepted. For MUP families the element must be an object whose
 // `type` discriminates the route type (isd/dsd/t1st/t2st); see
-// parseMUPRoute.
+// parseMUPRoute. For L3VPN families the element must be an object
+// carrying `{ rd, prefix }`; see parseVPNIPRoute.
 func parseRoute(rt *sobek.Runtime, family gobgp.Family, elem sobek.Value) (packet.Route, error) {
 	if family.Safi() == gobgp.SAFI_MUP {
 		if isStringValue(elem) {
@@ -560,6 +614,16 @@ func parseRoute(rt *sobek.Runtime, family gobgp.Family, elem sobek.Value) (packe
 			return nil, errors.New("expected mup route object")
 		}
 		return parseMUPRoute(family, eobj)
+	}
+	if family.Safi() == gobgp.SAFI_MPLS_VPN {
+		if isStringValue(elem) {
+			return nil, errors.New("l3vpn route must be an object with rd and prefix")
+		}
+		eobj := elem.ToObject(rt)
+		if eobj == nil {
+			return nil, errors.New("expected l3vpn route object")
+		}
+		return parseVPNIPRoute(family, eobj)
 	}
 	if isStringValue(elem) {
 		pref, err := netip.ParsePrefix(elem.String())
@@ -593,6 +657,25 @@ func newRouteForFamily(family gobgp.Family, pref netip.Prefix) (packet.Route, er
 	default:
 		return nil, fmt.Errorf("family %s is not supported for prefix-only route input", family)
 	}
+}
+
+// parseVPNIPRoute converts a JS L3VPN route descriptor into a
+// packet.Route. Shape:
+//
+//	{ rd: '65000:1', prefix: '10.0.0.0/24' }
+//
+// The MPLS Label is fixed at 0 because the SRv6 SID is signalled via
+// the Prefix-SID attribute (RFC 9252 section 4, no transposition).
+func parseVPNIPRoute(family gobgp.Family, obj *sobek.Object) (packet.Route, error) {
+	rd, err := parseRD(obj)
+	if err != nil {
+		return nil, err
+	}
+	pref, err := requirePrefix(obj, "prefix")
+	if err != nil {
+		return nil, err
+	}
+	return packet.NewVPNIPRoute(family, rd, pref)
 }
 
 // parseMUPRoute converts a JS MUP route descriptor into a packet.Route.
@@ -664,6 +747,161 @@ func parseMUPRoute(family gobgp.Family, obj *sobek.Object) (packet.Route, error)
 	default:
 		return nil, fmt.Errorf("unknown mup route type %q", rt)
 	}
+}
+
+// parseExtCommunities turns a JS array of ext-community strings into
+// gobgp ExtendedCommunityInterface values. Strings may carry an optional
+// type prefix ("rt:65000:1" / "soo:65000:1"); a bare value
+// ("65000:1") defaults to Route-Target so the common L3VPN case stays
+// terse. Backed by gobgp's ParseExtendedCommunity (RFC 4360 / RFC 4364
+// section 4.3.1).
+func parseExtCommunities(rt *sobek.Runtime, v sobek.Value) ([]gobgp.ExtendedCommunityInterface, error) {
+	arr := v.ToObject(rt)
+	if arr == nil {
+		return nil, errors.New("must be an array of strings")
+	}
+	lenV := arr.Get("length")
+	if common.IsNullish(lenV) {
+		return nil, errors.New("must be an array of strings")
+	}
+	n := int(lenV.ToInteger())
+	if n <= 0 {
+		return nil, errors.New("must be a non-empty array of strings")
+	}
+	out := make([]gobgp.ExtendedCommunityInterface, 0, n)
+	for i := range n {
+		elem := arr.Get(strconv.Itoa(i))
+		if elem == nil || common.IsNullish(elem) {
+			return nil, fmt.Errorf("[%d]: nullish entry", i)
+		}
+		s := elem.String()
+		subtype, val := splitExtCommunity(s)
+		ec, err := gobgp.ParseExtendedCommunity(subtype, val)
+		if err != nil {
+			return nil, fmt.Errorf("[%d] %q: %w", i, s, err)
+		}
+		out = append(out, ec)
+	}
+	return out, nil
+}
+
+// splitExtCommunity peels an optional type prefix off an ext-community
+// string. "rt:65000:1" → (RouteTarget, "65000:1"). A bare "65000:1"
+// defaults to Route-Target — the L3VPN-99%-case shorthand.
+func splitExtCommunity(s string) (gobgp.ExtendedCommunityAttrSubType, string) {
+	idx := strings.Index(s, ":")
+	if idx <= 0 {
+		return gobgp.EC_SUBTYPE_ROUTE_TARGET, s
+	}
+	prefix := strings.ToLower(s[:idx])
+	rest := s[idx+1:]
+	switch prefix {
+	case "rt":
+		return gobgp.EC_SUBTYPE_ROUTE_TARGET, rest
+	case "soo":
+		return gobgp.EC_SUBTYPE_ROUTE_ORIGIN, rest
+	}
+	return gobgp.EC_SUBTYPE_ROUTE_TARGET, s
+}
+
+// parseSRv6L3Service builds the SRv6 L3 Service config from a JS object:
+//
+//	{
+//	  sid:      'fc00:0:1::',
+//	  behavior: 'END_DT4',          // or 'END_DT6' / 'END_DT46' / 'END_DX4' / 'END_DX6'
+//	  structure?: {                  // SRv6 SID Structure Sub-Sub-TLV (RFC 9252 § 3.2.1)
+//	    locatorBlockLength:  40,
+//	    locatorNodeLength:   24,
+//	    functionLength:      16,
+//	    argumentLength:      0,
+//	    transpositionLength: 0,
+//	    transpositionOffset: 0,
+//	  },
+//	}
+//
+// `structure` defaults to (40, 24, 16, 0, 0, 0) — a common production
+// shape with no transposition, matching the label=0 placeholder NLRI
+// emitted by VPNIPRoute.
+func parseSRv6L3Service(rt *sobek.Runtime, v sobek.Value) (*packet.SRv6L3ServiceConfig, error) {
+	obj := v.ToObject(rt)
+	if obj == nil {
+		return nil, errors.New("must be an object")
+	}
+	sidStr := optString(obj, "sid")
+	if sidStr == "" {
+		return nil, errors.New("missing sid")
+	}
+	sid, err := netip.ParseAddr(sidStr)
+	if err != nil {
+		return nil, fmt.Errorf("sid: %w", err)
+	}
+	behStr := optString(obj, "behavior")
+	if behStr == "" {
+		return nil, errors.New("missing behavior")
+	}
+	beh, err := srBehaviorByName(behStr)
+	if err != nil {
+		return nil, err
+	}
+	cfg := &packet.SRv6L3ServiceConfig{
+		SID:                 sid,
+		EndpointBehavior:    beh,
+		LocatorBlockLength:  40,
+		LocatorNodeLength:   24,
+		FunctionLength:      16,
+		ArgumentLength:      0,
+		TranspositionLength: 0,
+		TranspositionOffset: 0,
+	}
+	if sv := obj.Get("structure"); !common.IsNullish(sv) {
+		sobj := sv.ToObject(rt)
+		if sobj == nil {
+			return nil, errors.New("structure must be an object")
+		}
+		if v := sobj.Get("locatorBlockLength"); !common.IsNullish(v) {
+			cfg.LocatorBlockLength = uint8(v.ToInteger()) // #nosec G115 -- LBL is a 1-octet field per RFC 9252 § 3.2.1
+		}
+		if v := sobj.Get("locatorNodeLength"); !common.IsNullish(v) {
+			cfg.LocatorNodeLength = uint8(v.ToInteger()) // #nosec G115 -- LNL is a 1-octet field per RFC 9252 § 3.2.1
+		}
+		if v := sobj.Get("functionLength"); !common.IsNullish(v) {
+			cfg.FunctionLength = uint8(v.ToInteger()) // #nosec G115 -- FL is a 1-octet field per RFC 9252 § 3.2.1
+		}
+		if v := sobj.Get("argumentLength"); !common.IsNullish(v) {
+			cfg.ArgumentLength = uint8(v.ToInteger()) // #nosec G115 -- AL is a 1-octet field per RFC 9252 § 3.2.1
+		}
+		if v := sobj.Get("transpositionLength"); !common.IsNullish(v) {
+			cfg.TranspositionLength = uint8(v.ToInteger()) // #nosec G115 -- TL is a 1-octet field per RFC 9252 § 3.2.1
+		}
+		if v := sobj.Get("transpositionOffset"); !common.IsNullish(v) {
+			cfg.TranspositionOffset = uint8(v.ToInteger()) // #nosec G115 -- TO is a 1-octet field per RFC 9252 § 3.2.1
+		}
+	}
+	if cfg.TranspositionLength != 0 {
+		return nil, errors.New("transpositionLength must be 0 (xk6-bgp emits the SID in full; label=0)")
+	}
+	return cfg, nil
+}
+
+// srBehaviorByName maps the L3-VPN-relevant Endpoint Behavior names from
+// the IANA SRv6 Endpoint Behaviors registry (RFC 8986) to gobgp's
+// SRBehavior constants. We expose only the behaviors that make sense
+// for a BGP L3VPN PE; other SRv6 functions live in different signalling
+// paths.
+func srBehaviorByName(s string) (gobgp.SRBehavior, error) {
+	switch strings.ToUpper(s) {
+	case "END_DT4":
+		return gobgp.END_DT4, nil
+	case "END_DT6":
+		return gobgp.END_DT6, nil
+	case "END_DT46":
+		return gobgp.END_DT46, nil
+	case "END_DX4":
+		return gobgp.END_DX4, nil
+	case "END_DX6":
+		return gobgp.END_DX6, nil
+	}
+	return 0, fmt.Errorf("unknown endpoint behavior %q (supported: END_DT4, END_DT6, END_DT46, END_DX4, END_DX6)", s)
 }
 
 func parseRD(obj *sobek.Object) (gobgp.RouteDistinguisherInterface, error) {

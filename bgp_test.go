@@ -205,7 +205,7 @@ func TestParsePrefixList_Errors(t *testing.T) {
 				_ = o.Set("prefixes", v)
 				return o
 			},
-			want: "missing type",
+			want: "descriptor must carry either",
 		},
 		{
 			name: "badPrefix",
@@ -325,6 +325,165 @@ func TestParsePrefixList_MUPDescriptors(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("got[%d]=%s, want %s", i, got[i], want[i])
 		}
+	}
+}
+
+func TestParseRoutesArray_L3VPN(t *testing.T) {
+	rt := newRT(t)
+	arr := evalArray(t, rt, `[
+		{ rd: '65000:1', prefix: '10.10.10.0/24' },
+		{ rd: '65000:1', prefix: '10.10.11.0/24' }
+	]`)
+	got, err := parseRoutesArray(rt, gobgp.RF_IPv4_VPN, arr)
+	if err != nil {
+		t.Fatalf("parseRoutesArray: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d, want 2", len(got))
+	}
+	wantKeys := []string{
+		"65000:1:10.10.10.0/24",
+		"65000:1:10.10.11.0/24",
+	}
+	for i, want := range wantKeys {
+		vr, ok := got[i].(packet.VPNIPRoute)
+		if !ok {
+			t.Fatalf("routes[%d] is %T, want VPNIPRoute", i, got[i])
+		}
+		if vr.Key() != want {
+			t.Errorf("routes[%d].Key=%s, want %s", i, vr.Key(), want)
+		}
+	}
+
+	arr6 := evalArray(t, rt, `[{ rd: '65000:1', prefix: '2001:db8:1::/48' }]`)
+	got6, err := parseRoutesArray(rt, gobgp.RF_IPv6_VPN, arr6)
+	if err != nil {
+		t.Fatalf("parseRoutesArray v6: %v", err)
+	}
+	if len(got6) != 1 {
+		t.Fatalf("v6 len=%d, want 1", len(got6))
+	}
+	vr := got6[0].(packet.VPNIPRoute)
+	if vr.Key() != "65000:1:2001:db8:1::/48" {
+		t.Errorf("v6 routes[0].Key=%s", vr.Key())
+	}
+}
+
+func TestParseRoutesArray_L3VPNErrors(t *testing.T) {
+	rt := newRT(t)
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"bareStringNotAllowed", `["10.0.0.0/24"]`, "must be an object"},
+		{"missingRD", `[{ prefix: '10.0.0.0/24' }]`, "missing rd"},
+		{"missingPrefix", `[{ rd: '65000:1' }]`, "missing prefix"},
+		{"familyMismatch", `[{ rd: '65000:1', prefix: '2001:db8::/64' }]`, "does not match"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			arr := evalArray(t, rt, tc.src)
+			_, err := parseRoutesArray(rt, gobgp.RF_IPv4_VPN, arr)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+func TestParsePrefixList_L3VPNDescriptors(t *testing.T) {
+	rt := newRT(t)
+	obj := rt.NewObject()
+	arr, err := rt.RunString(`[
+		{ rd: '65000:1', prefix: '10.0.0.0/24' },
+		{ rd: '65000:1', prefix: '2001:db8::/48' },
+		'10.10.0.0/24'
+	]`)
+	if err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if err := obj.Set("prefixes", arr); err != nil {
+		t.Fatalf("set prefixes: %v", err)
+	}
+	got, err := parsePrefixList(rt, obj)
+	if err != nil {
+		t.Fatalf("parsePrefixList: %v", err)
+	}
+	want := []string{
+		"65000:1:10.0.0.0/24",
+		"65000:1:2001:db8::/48",
+		"10.10.0.0/24",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len=%d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got[%d]=%s, want %s", i, got[i], want[i])
+		}
+	}
+}
+
+func TestParseSRv6L3Service(t *testing.T) {
+	rt := newRT(t)
+	v, err := rt.RunString(`({
+		sid: 'fc00:0:1::',
+		behavior: 'END_DT4',
+		structure: {
+			locatorBlockLength:  40,
+			locatorNodeLength:   24,
+			functionLength:      16,
+			argumentLength:      0,
+		}
+	})`)
+	if err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	cfg, err := parseSRv6L3Service(rt, v)
+	if err != nil {
+		t.Fatalf("parseSRv6L3Service: %v", err)
+	}
+	if cfg.SID.String() != "fc00:0:1::" {
+		t.Errorf("sid=%s", cfg.SID)
+	}
+	if cfg.EndpointBehavior != gobgp.END_DT4 {
+		t.Errorf("behavior=%d, want END_DT4", cfg.EndpointBehavior)
+	}
+	if cfg.FunctionLength != 16 {
+		t.Errorf("functionLength=%d, want 16", cfg.FunctionLength)
+	}
+}
+
+func TestParseSRv6L3ServiceErrors(t *testing.T) {
+	rt := newRT(t)
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"missingSID", `({ behavior: 'END_DT4' })`, "missing sid"},
+		{"missingBehavior", `({ sid: 'fc00::1' })`, "missing behavior"},
+		{"unknownBehavior", `({ sid: 'fc00::1', behavior: 'NONSENSE' })`, "unknown endpoint behavior"},
+		{"transposition", `({ sid: 'fc00::1', behavior: 'END_DT4', structure: { transpositionLength: 16 } })`, "transpositionLength"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := rt.RunString(tc.src)
+			if err != nil {
+				t.Fatalf("eval: %v", err)
+			}
+			_, err = parseSRv6L3Service(rt, v)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.want)
+			}
+		})
 	}
 }
 
