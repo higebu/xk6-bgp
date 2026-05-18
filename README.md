@@ -166,12 +166,12 @@ goroutine, so blocking in one VU does not block others.
 | `family` | string | AFI/SAFI declared in `peer.families` (required) |
 | `nextHop` | string | IPv4 or IPv6 next-hop (required for `advertise`) |
 | `localAs` | number | AS_PATH origin AS (required for `advertise`) |
-| `routes` | string[] \| object[] | For `ipv4-unicast` / `ipv6-unicast`: prefixes (e.g. `['10.0.0.0/24']`) or `{ prefix }` objects. For `ipv4-mup` / `ipv6-mup`: route descriptors keyed by `type` (see [MUP routes](#mup-routes)). For `l3vpn-ipv4` / `l3vpn-ipv6`: route descriptors keyed by `rd` (see [SRv6 L3VPN routes](#srv6-l3vpn-routes)) (required) |
+| `routes` | string[] \| object[] | Prefix strings (`['10.0.0.0/24']`) or family-specific descriptor objects — see [Supported AFI/SAFI](#supported-afisafi) (required) |
 | `origin` | number | ORIGIN attribute: `0` IGP, `1` EGP, `2` INCOMPLETE (`advertise` only, default `0`) |
 | `med` | number | MULTI_EXIT_DISC (`advertise` only) |
 | `localPref` | number | LOCAL_PREF for iBGP (`advertise` only) |
-| `extCommunities` | string[] | EXTENDED_COMMUNITIES entries ([RFC 4360](https://www.rfc-editor.org/rfc/rfc4360.txt)). Each string may carry an optional type prefix (`rt:` Route-Target, `soo:` Site-of-Origin); a bare value defaults to Route-Target. Required for L3VPN distribution per [RFC 4364](https://www.rfc-editor.org/rfc/rfc4364.txt) section 4.3.1 |
-| `srv6L3Service` | object | SRv6 L3 Service TLV ([RFC 9252](https://www.rfc-editor.org/rfc/rfc9252.txt)). Required for `l3vpn-ipv4` / `l3vpn-ipv6` (see [SRv6 L3VPN routes](#srv6-l3vpn-routes)) |
+| `extCommunities` | string[] | EXTENDED_COMMUNITIES entries ([RFC 4360](https://www.rfc-editor.org/rfc/rfc4360.txt)). Each string may carry an optional type prefix (`rt:` / `soo:`); a bare value defaults to Route-Target. See per-family doc for when this is required |
+| `srv6L3Service` | object | SRv6 L3 Service TLV ([RFC 9252](https://www.rfc-editor.org/rfc/rfc9252.txt)); see [`docs/srv6_l3vpn.md`](./docs/srv6_l3vpn.md) |
 | `useMpReach` | boolean | Force IPv4-unicast through `MP_REACH_NLRI` instead of the UPDATE NLRI field |
 | `useExtendedMessages` | boolean | Chunk UPDATEs up to the RFC 8654 65535-byte limit. The peer **must** have advertised capability 6 — `advertise`/`withdraw` returns an error otherwise (see [Capabilities](#capabilities)) |
 | `updateRate` | number | Cap the per-Peer UPDATE send rate at this many messages per second (`0` = unlimited) |
@@ -180,72 +180,9 @@ goroutine, so blocking in one VU does not block others.
 
 | Field | Type | Description |
 |---|---|---|
-| `prefixes` | (string \| object)[] | Expected route set: prefix strings for IP unicast or MUP descriptor objects (same shape as `advertise.routes`) (required) |
+| `prefixes` | (string \| object)[] | Expected route set: prefix strings or family-specific descriptor objects (same shape as `advertise.routes` — see [Supported AFI/SAFI](#supported-afisafi)) (required) |
 | `timeout` | string \| number | k6 duration string or seconds; throws if not met before this |
 | `sentAtMonoNs` | number | Filter observations that predate this mono-ns timestamp, and anchor the `bgp_prefix_received_duration` sample (typically `advertise.sentAtMonoNs`) |
-
-### MUP routes
-
-For the MUP SAFI (`ipv4-mup` / `ipv6-mup`, draft-mpmz-bess-mup-safi-03)
-the `routes` entries are objects with a `type` discriminator. The
-descriptors are shared between `advertise` / `withdraw` / `waitForPrefixes`.
-
-| `type` | Required fields | Optional fields | Reference |
-|---|---|---|---|
-| `'isd'`  | `rd`, `prefix` | — | section 3.1.1 |
-| `'dsd'`  | `rd`, `address` | — | section 3.1.2 |
-| `'t1st'` | `rd`, `prefix`, `teid`, `qfi`, `endpoint` | `source` | section 3.1.3 |
-| `'t2st'` | `rd`, `endpoint`, `endpointAddressLength`, `teid` | — | section 3.1.4 |
-
-`rd` accepts any RD form gobgp parses (`asn:n`, `asn.asn:n`, `ipv4:n`).
-`teid` is given as an IPv4-shaped dotted-quad to carry the 32-bit TEID
-(e.g. `'0.0.0.100'` for TEID 100). `endpointAddressLength` is the
-combined Endpoint Address + TEID bit length per the draft: 32..64 for
-IPv4 endpoints, 128..160 for IPv6.
-
-### SRv6 L3VPN routes
-
-For the L3VPN SAFI carried over SRv6
-([RFC 9252](https://www.rfc-editor.org/rfc/rfc9252.txt)) the family
-strings are `l3vpn-ipv4` / `l3vpn-ipv6`. The NLRI on the wire is the
-classical `LabeledVPNIPAddrPrefix` (SAFI 128); the MPLS Label field is
-fixed at `0` and the SRv6 SID is signalled in full via the BGP
-Prefix-SID attribute (no-transposition mode per RFC 9252 § 4).
-
-`routes` entries are objects:
-
-| Field | Required | Description |
-|---|---|---|
-| `rd` | yes | Route Distinguisher; same format as MUP |
-| `prefix` | yes | Customer prefix (IPv4 for `l3vpn-ipv4`, IPv6 for `l3vpn-ipv6`) |
-
-The advertise call must also carry the SRv6 service config and a
-Route-Target ext-community. Every NLRI in one UPDATE shares the same
-SID (the "one SID per VRF" PE pattern):
-
-```javascript
-peer.advertise({
-  family:         'l3vpn-ipv4',
-  nextHop:        '10.0.0.1',
-  localAs:        65001,
-  extCommunities: ['rt:65000:100'],
-  srv6L3Service: {
-    sid:      'fc00:0:1::',
-    behavior: 'END_DT4',          // END_DT4 / END_DT6 / END_DT46 / END_DX4 / END_DX6
-    structure: {                    // SRv6 SID Structure Sub-Sub-TLV (RFC 9252 § 3.2.1)
-      locatorBlockLength: 40,
-      locatorNodeLength:  24,
-      functionLength:     16,
-      argumentLength:     0,
-    },
-  },
-  routes: [{ rd: '65000:1', prefix: '10.99.0.0/24' }],
-});
-```
-
-`structure` defaults to `(40, 24, 16, 0, 0, 0)` when omitted.
-`transpositionLength` must stay `0` because xk6-bgp does not transpose
-SID bits into the label field.
 
 ### Cross-VU coordination
 
@@ -255,6 +192,15 @@ all VUs to reach `Established` before any of them advertises) so that
 the benchmark measures the steady-state throughput rather than ramp-up
 artifacts. Barriers are single-use — pick a fresh `name` per
 rendezvous if a script needs to barrier multiple times.
+
+## Supported AFI/SAFI
+
+| Family string | SAFI | Route descriptor | Reference | Doc | Example |
+|---|---|---|---|---|---|
+| `ipv4-unicast` | 1 | prefix string or `{ prefix }` | [RFC 4271](https://www.rfc-editor.org/rfc/rfc4271.txt) | — | [`examples/ipv4_unicast.js`](./examples/ipv4_unicast.js) |
+| `ipv6-unicast` | 1 | prefix string or `{ prefix }` | [RFC 4760](https://www.rfc-editor.org/rfc/rfc4760.txt) | — | [`examples/ipv6_unicast.js`](./examples/ipv6_unicast.js) |
+| `ipv4-mup` / `ipv6-mup` | 85 | `{ type, rd, ... }` | [draft-mpmz-bess-mup-safi](https://datatracker.ietf.org/doc/draft-mpmz-bess-mup-safi/) | [`docs/mup.md`](./docs/mup.md) | [`examples/mup.js`](./examples/mup.js) |
+| `l3vpn-ipv4` / `l3vpn-ipv6` | 128 | `{ rd, prefix }` (+ `srv6L3Service` on advertise) | [RFC 4364](https://www.rfc-editor.org/rfc/rfc4364.txt), [RFC 9252](https://www.rfc-editor.org/rfc/rfc9252.txt) | [`docs/srv6_l3vpn.md`](./docs/srv6_l3vpn.md) | [`examples/srv6_l3vpn.js`](./examples/srv6_l3vpn.js) |
 
 ## Metrics
 
