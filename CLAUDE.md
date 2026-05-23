@@ -90,16 +90,29 @@ FSM and TCP I/O loop are xk6-bgp's own.
 
 ```sh
 go install go.k6.io/xk6/cmd/xk6@latest
+go install github.com/securego/gosec/v2/cmd/gosec@latest
+go install golang.org/x/vuln/cmd/govulncheck@latest
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
 xk6 build --with github.com/higebu/xk6-bgp=.
 go build ./... && go vet ./... && go test ./...
+gosec ./...
+govulncheck ./...
+golangci-lint run ./...
 ./k6 run examples/<scenario>.js
 ```
 
-Pass all of the following before treating a change as done:
+Pass all of the following before treating a change as done — these
+mirror the GitHub Actions ci.yml jobs, so skipping them locally just
+defers the failure:
 
 - `go build ./...` is clean
 - `go vet ./...` is clean
 - `go test ./...` passes
+- `gosec ./...` reports zero issues (use `// #nosec G<id> -- <reason>`
+  to annotate verified-safe conversions, matching the existing style)
+- `govulncheck ./...` is clean
+- `golangci-lint run ./...` is clean
 - `xk6 build` produces `./k6`
 - At least one `examples/*.js` runs end-to-end and emits the expected
   metrics
