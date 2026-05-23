@@ -3,6 +3,7 @@ package bgp
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"reflect"
 	"strconv"
@@ -386,16 +387,37 @@ func parsePrefixList(rt *sobek.Runtime, obj *sobek.Object) ([]string, error) {
 
 // descriptorKey routes a JS route-descriptor object to the per-family
 // canonicalizer that produces the gobgp NLRI.String() used as the
-// observed-set key. MUP descriptors carry a `type` discriminator;
-// L3VPN descriptors carry `rd` + `prefix`.
+// observed-set key. The `type` discriminator selects between MUP and
+// EVPN by value (MUP: isd/dsd/t1st/t2st, EVPN: mac-ip/imet/ip-prefix).
+// L3VPN descriptors carry `rd` + `prefix` with no `type`.
 func descriptorKey(obj *sobek.Object) (string, error) {
 	if !common.IsNullish(obj.Get("type")) {
+		ts := optString(obj, "type")
+		switch ts {
+		case packet.EVPNTypeMacIP, packet.EVPNTypeIMET, packet.EVPNTypeIPPrefix:
+			return evpnDescriptorKey(obj)
+		}
 		return mupDescriptorKey(obj)
 	}
 	if !common.IsNullish(obj.Get("rd")) {
 		return vpnDescriptorKey(obj)
 	}
-	return "", errors.New("descriptor must carry either `type` (MUP) or `rd` (L3VPN)")
+	return "", errors.New("descriptor must carry either `type` (MUP/EVPN) or `rd` (L3VPN)")
+}
+
+// evpnDescriptorKey turns an EVPN route descriptor into the canonical
+// gobgp EVPNNLRI.String() form so waitForPrefixes can match against
+// the receive observed-set.
+func evpnDescriptorKey(obj *sobek.Object) (string, error) {
+	r, err := parseEVPNRoute(obj)
+	if err != nil {
+		return "", err
+	}
+	er, ok := r.(packet.EVPNRoute)
+	if !ok {
+		return "", fmt.Errorf("internal: parseEVPNRoute returned %T", r)
+	}
+	return er.Key(), nil
 }
 
 // vpnDescriptorKey turns an L3VPN route descriptor into the canonical
@@ -536,6 +558,13 @@ func (p *Peer) parseAdvertiseArg(rt *sobek.Runtime, arg sobek.Value, withdraw bo
 			}
 			attrs.SRv6L3Service = cfg
 		}
+		if v := obj.Get("pmsiTunnel"); !common.IsNullish(v) {
+			cfg, err := parsePMSITunnel(rt, v)
+			if err != nil {
+				return peer.AdvertiseRequest{}, fmt.Errorf("pmsiTunnel: %w", err)
+			}
+			attrs.PMSITunnel = cfg
+		}
 	}
 
 	routes, err := parseRoutesArray(rt, fam, obj.Get("routes"))
@@ -625,6 +654,16 @@ func parseRoute(rt *sobek.Runtime, family gobgp.Family, elem sobek.Value) (packe
 		}
 		return parseVPNIPRoute(family, eobj)
 	}
+	if family == gobgp.RF_EVPN {
+		if isStringValue(elem) {
+			return nil, errors.New("evpn route must be an object with a type field")
+		}
+		eobj := elem.ToObject(rt)
+		if eobj == nil {
+			return nil, errors.New("expected evpn route object")
+		}
+		return parseEVPNRoute(eobj)
+	}
 	if isStringValue(elem) {
 		pref, err := netip.ParsePrefix(elem.String())
 		if err != nil {
@@ -648,8 +687,8 @@ func parseRoute(rt *sobek.Runtime, family gobgp.Family, elem sobek.Value) (packe
 }
 
 // newRouteForFamily picks the packet.Route constructor for the family.
-// Only IPv4/IPv6 unicast are wired today; add new cases when adding a
-// SAFI (MUP, VPN, EVPN, ...).
+// Only IPv4/IPv6 unicast can be built from a bare prefix; MUP / VPN /
+// EVPN require their own descriptor objects (see parseRoute).
 func newRouteForFamily(family gobgp.Family, pref netip.Prefix) (packet.Route, error) {
 	switch family {
 	case gobgp.RF_IPv4_UC, gobgp.RF_IPv6_UC:
@@ -676,6 +715,126 @@ func parseVPNIPRoute(family gobgp.Family, obj *sobek.Object) (packet.Route, erro
 		return nil, err
 	}
 	return packet.NewVPNIPRoute(family, rd, pref)
+}
+
+// parseEVPNRoute converts a JS EVPN route descriptor into a
+// packet.Route. The `type` discriminator selects the route format:
+//
+//	{ type: 'mac-ip',    rd, esi?, ethTag?, mac, ip?, labels:[..] }
+//	{ type: 'imet',      rd, ethTag?, originIp }
+//	{ type: 'ip-prefix', rd, esi?, ethTag?, prefix, gwIp?, label }
+//
+// labels / label are 24-bit values stuffed verbatim into the NLRI's
+// MPLS Label field. The mapping to a transport (VXLAN VNI, MPLS
+// label, …) is left to the caller per RFC 8365 section 5.
+func parseEVPNRoute(obj *sobek.Object) (packet.Route, error) {
+	rt := optString(obj, "type")
+	if rt == "" {
+		return nil, errors.New("missing type")
+	}
+	rd, err := parseRD(obj)
+	if err != nil {
+		return nil, err
+	}
+	ethTag := optUint32(obj, "ethTag")
+	switch rt {
+	case packet.EVPNTypeMacIP:
+		esi, err := parseESI(obj)
+		if err != nil {
+			return nil, err
+		}
+		macStr := optString(obj, "mac")
+		if macStr == "" {
+			return nil, errors.New("missing mac")
+		}
+		mac, err := net.ParseMAC(macStr)
+		if err != nil {
+			return nil, fmt.Errorf("mac: %w", err)
+		}
+		var ip netip.Addr
+		if v := obj.Get("ip"); !common.IsNullish(v) {
+			ip, err = netip.ParseAddr(v.String())
+			if err != nil {
+				return nil, fmt.Errorf("ip: %w", err)
+			}
+		}
+		labels, err := parseLabels(obj)
+		if err != nil {
+			return nil, err
+		}
+		return packet.NewEVPNMacIPRoute(rd, esi, ethTag, mac, ip, labels)
+	case packet.EVPNTypeIMET:
+		originIP, err := requireAddr(obj, "originIp")
+		if err != nil {
+			return nil, err
+		}
+		return packet.NewEVPNIMETRoute(rd, ethTag, originIP)
+	case packet.EVPNTypeIPPrefix:
+		esi, err := parseESI(obj)
+		if err != nil {
+			return nil, err
+		}
+		pref, err := requirePrefix(obj, "prefix")
+		if err != nil {
+			return nil, err
+		}
+		var gw netip.Addr
+		if v := obj.Get("gwIp"); !common.IsNullish(v) {
+			gw, err = netip.ParseAddr(v.String())
+			if err != nil {
+				return nil, fmt.Errorf("gwIp: %w", err)
+			}
+		}
+		label := optUint32(obj, "label")
+		return packet.NewEVPNIPPrefixRoute(rd, esi, ethTag, pref, gw, label)
+	}
+	return nil, fmt.Errorf("unknown evpn route type %q", rt)
+}
+
+// parseESI reads the optional `esi` field. Empty / missing /
+// "single-homed" maps to the all-zero ESI. Multi-homed deployments
+// pass a gobgp-style space-separated form (see packet.ParseESI).
+func parseESI(obj *sobek.Object) (gobgp.EthernetSegmentIdentifier, error) {
+	v := obj.Get("esi")
+	if common.IsNullish(v) {
+		return packet.ParseESI("")
+	}
+	esi, err := packet.ParseESI(v.String())
+	if err != nil {
+		return gobgp.EthernetSegmentIdentifier{}, fmt.Errorf("esi: %w", err)
+	}
+	return esi, nil
+}
+
+// parseLabels reads the `labels` array (preferred) or a single
+// `label` scalar. Both are accepted so a caller advertising VXLAN
+// VNIs can spell either form. The output is 1 or 2 entries.
+func parseLabels(obj *sobek.Object) ([]uint32, error) {
+	if v := obj.Get("labels"); !common.IsNullish(v) {
+		exp, ok := v.Export().([]any)
+		if !ok {
+			return nil, errors.New("labels must be a number array")
+		}
+		if len(exp) == 0 || len(exp) > 2 {
+			return nil, fmt.Errorf("labels must contain 1 or 2 entries (got %d)", len(exp))
+		}
+		out := make([]uint32, len(exp))
+		for i, x := range exp {
+			switch t := x.(type) {
+			case int64:
+				out[i] = uint32(t) // #nosec G115 -- 20-bit label; range checked by gobgp's labelSerialize
+			case float64:
+				out[i] = uint32(t) // #nosec G115 -- ditto
+			default:
+				return nil, fmt.Errorf("labels[%d]: expected number, got %T", i, x)
+			}
+		}
+		return out, nil
+	}
+	if v := obj.Get("label"); !common.IsNullish(v) {
+		return []uint32{uint32(v.ToInteger())}, nil // #nosec G115 -- 20-bit label
+	}
+	return nil, errors.New("missing label (or labels)")
 }
 
 // parseMUPRoute converts a JS MUP route descriptor into a packet.Route.
@@ -775,8 +934,7 @@ func parseExtCommunities(rt *sobek.Runtime, v sobek.Value) ([]gobgp.ExtendedComm
 			return nil, fmt.Errorf("[%d]: nullish entry", i)
 		}
 		s := elem.String()
-		subtype, val := splitExtCommunity(s)
-		ec, err := gobgp.ParseExtendedCommunity(subtype, val)
+		ec, err := parseExtCommunity(s)
 		if err != nil {
 			return nil, fmt.Errorf("[%d] %q: %w", i, s, err)
 		}
@@ -785,23 +943,38 @@ func parseExtCommunities(rt *sobek.Runtime, v sobek.Value) ([]gobgp.ExtendedComm
 	return out, nil
 }
 
-// splitExtCommunity peels an optional type prefix off an ext-community
-// string. "rt:65000:1" → (RouteTarget, "65000:1"). A bare "65000:1"
-// defaults to Route-Target — the L3VPN-99%-case shorthand.
-func splitExtCommunity(s string) (gobgp.ExtendedCommunityAttrSubType, string) {
+// parseExtCommunity converts a single ext-community shorthand into a
+// gobgp ExtendedCommunityInterface. Supported prefixes:
+//
+//	rt:<asn:val|ip:val>          — Route-Target (RFC 4360 / RFC 4364)
+//	soo:<asn:val|ip:val>         — Site-of-Origin (RFC 4360)
+//	encap:<vxlan|mpls|geneve|…>  — Encapsulation EC (RFC 9012 / RFC 8365)
+//	routermac:<MAC>              — EVPN Router's MAC EC (RFC 9135 § 9)
+//
+// A bare value without a recognized prefix defaults to Route-Target
+// (the L3VPN-99%-case shorthand).
+func parseExtCommunity(s string) (gobgp.ExtendedCommunityInterface, error) {
 	idx := strings.Index(s, ":")
 	if idx <= 0 {
-		return gobgp.EC_SUBTYPE_ROUTE_TARGET, s
+		return gobgp.ParseExtendedCommunity(gobgp.EC_SUBTYPE_ROUTE_TARGET, s)
 	}
 	prefix := strings.ToLower(s[:idx])
 	rest := s[idx+1:]
 	switch prefix {
 	case "rt":
-		return gobgp.EC_SUBTYPE_ROUTE_TARGET, rest
+		return gobgp.ParseExtendedCommunity(gobgp.EC_SUBTYPE_ROUTE_TARGET, rest)
 	case "soo":
-		return gobgp.EC_SUBTYPE_ROUTE_ORIGIN, rest
+		return gobgp.ParseExtendedCommunity(gobgp.EC_SUBTYPE_ROUTE_ORIGIN, rest)
+	case "encap":
+		return gobgp.ParseExtendedCommunity(gobgp.EC_SUBTYPE_ENCAPSULATION, rest)
+	case "routermac":
+		mac, err := net.ParseMAC(rest)
+		if err != nil {
+			return nil, fmt.Errorf("routermac: %w", err)
+		}
+		return gobgp.NewRoutersMacExtended(mac.String()), nil
 	}
-	return gobgp.EC_SUBTYPE_ROUTE_TARGET, s
+	return gobgp.ParseExtendedCommunity(gobgp.EC_SUBTYPE_ROUTE_TARGET, s)
 }
 
 // parseSRv6L3Service builds the SRv6 L3 Service config from a JS object:
@@ -881,6 +1054,75 @@ func parseSRv6L3Service(rt *sobek.Runtime, v sobek.Value) (*packet.SRv6L3Service
 		return nil, errors.New("transpositionLength must be 0 (xk6-bgp emits the SID in full; label=0)")
 	}
 	return cfg, nil
+}
+
+// parsePMSITunnel builds a PMSITunnelConfig from a JS object:
+//
+//	{
+//	  tunnel:             6,                // PMSI Tunnel Type (RFC 6514 § 11) or string alias
+//	  isLeafInfoRequired: false,
+//	  label:              10100,             // 20-bit value placed in the 24-bit label field
+//	  endpoint:           '10.0.0.1',        // tunnel-ID payload (e.g. Ingress-Repl egress PE)
+//	}
+//
+// `tunnel` may also be one of the common name aliases:
+// "no-tunnel-info", "rsvp-te-p2mp", "mldp-p2mp", "pim-ssm", "pim-sm",
+// "bidir-pim", "ingress-repl", "mldp-mp2mp" — matching the IANA
+// "P-Multicast Service Interface Tunnel Tunnel Types" registry.
+func parsePMSITunnel(rt *sobek.Runtime, v sobek.Value) (*packet.PMSITunnelConfig, error) {
+	obj := v.ToObject(rt)
+	if obj == nil {
+		return nil, errors.New("must be an object")
+	}
+	tv := obj.Get("tunnel")
+	if common.IsNullish(tv) {
+		return nil, errors.New("missing tunnel")
+	}
+	var tunnel uint8
+	if isStringValue(tv) {
+		t, err := pmsiTunnelByName(tv.String())
+		if err != nil {
+			return nil, err
+		}
+		tunnel = t
+	} else {
+		tunnel = uint8(tv.ToInteger()) // #nosec G115 -- PMSI Tunnel Type is a 1-octet field per RFC 6514 § 5
+	}
+	cfg := &packet.PMSITunnelConfig{
+		Tunnel:             tunnel,
+		IsLeafInfoRequired: optBool(obj, "isLeafInfoRequired"),
+		Label:              optUint32(obj, "label"),
+	}
+	if ev := obj.Get("endpoint"); !common.IsNullish(ev) {
+		ep, err := netip.ParseAddr(ev.String())
+		if err != nil {
+			return nil, fmt.Errorf("endpoint: %w", err)
+		}
+		cfg.Endpoint = ep
+	}
+	return cfg, nil
+}
+
+func pmsiTunnelByName(s string) (uint8, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "no-tunnel-info":
+		return uint8(gobgp.PMSI_TUNNEL_TYPE_NO_TUNNEL), nil
+	case "rsvp-te-p2mp":
+		return uint8(gobgp.PMSI_TUNNEL_TYPE_RSVP_TE_P2MP), nil
+	case "mldp-p2mp":
+		return uint8(gobgp.PMSI_TUNNEL_TYPE_MLDP_P2MP), nil
+	case "pim-ssm":
+		return uint8(gobgp.PMSI_TUNNEL_TYPE_PIM_SSM_TREE), nil
+	case "pim-sm":
+		return uint8(gobgp.PMSI_TUNNEL_TYPE_PIM_SM_TREE), nil
+	case "bidir-pim":
+		return uint8(gobgp.PMSI_TUNNEL_TYPE_BIDIR_PIM_TREE), nil
+	case "ingress-repl":
+		return uint8(gobgp.PMSI_TUNNEL_TYPE_INGRESS_REPL), nil
+	case "mldp-mp2mp":
+		return uint8(gobgp.PMSI_TUNNEL_TYPE_MLDP_MP2MP), nil
+	}
+	return 0, fmt.Errorf("unknown pmsi tunnel type %q", s)
 }
 
 // srBehaviorByName maps the L3-VPN-relevant Endpoint Behavior names from

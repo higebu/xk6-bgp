@@ -45,6 +45,49 @@ type PathAttrs struct {
 	// NLRI in the UPDATE — the common "one SID per VRF" L3VPN deployment
 	// pattern. Per-prefix SID variation would need separate UPDATEs.
 	SRv6L3Service *SRv6L3ServiceConfig
+	// PMSITunnel, when non-nil, is emitted as a PMSI Tunnel attribute
+	// (RFC 6514). For EVPN Type 3 (Inclusive Multicast) with Ingress
+	// Replication the tunnel endpoint identifies the egress PE
+	// (RFC 7432 section 11.1 / RFC 8365 section 5.1.3). Other tunnel
+	// types are encoded as gobgp's DefaultPmsiTunnelID payload.
+	PMSITunnel *PMSITunnelConfig
+}
+
+// PMSITunnelConfig describes a PMSI Tunnel attribute (RFC 6514
+// section 5). Tunnel encodes the IANA PMSI Tunnel Type. Label carries
+// the 20-bit value placed in the 24-bit MPLS label field — VXLAN
+// deployments stuff the VNI in here per RFC 8365 section 5.1.3.
+// Endpoint is the tunnel-ID payload; for Ingress Replication it is
+// the egress endpoint IP, and for the no-tunnel-info case it may be
+// the zero Addr (emits an empty tunnel ID).
+type PMSITunnelConfig struct {
+	Tunnel             uint8
+	IsLeafInfoRequired bool
+	Label              uint32
+	Endpoint           netip.Addr
+}
+
+func (c *PMSITunnelConfig) buildAttr() (*bgp.PathAttributePmsiTunnel, error) {
+	var id bgp.PmsiTunnelIDInterface
+	if bgp.PmsiTunnelType(c.Tunnel) == bgp.PMSI_TUNNEL_TYPE_INGRESS_REPL {
+		if !c.Endpoint.IsValid() {
+			return nil, fmt.Errorf("pmsiTunnel: endpoint is required for Ingress Replication")
+		}
+		ep, err := bgp.NewIngressReplTunnelID(c.Endpoint.Unmap())
+		if err != nil {
+			return nil, fmt.Errorf("pmsiTunnel: %w", err)
+		}
+		id = ep
+	} else if c.Endpoint.IsValid() {
+		id = bgp.NewDefaultPmsiTunnelID(c.Endpoint.Unmap().AsSlice())
+	} else {
+		id = bgp.NewDefaultPmsiTunnelID(nil)
+	}
+	attr := bgp.NewPathAttributePmsiTunnel(bgp.PmsiTunnelType(c.Tunnel), c.IsLeafInfoRequired, c.Label, id)
+	if attr == nil {
+		return nil, fmt.Errorf("pmsiTunnel: failed to build attribute")
+	}
+	return attr, nil
 }
 
 // SRv6L3ServiceConfig describes the contents of an RFC 9252 SRv6 L3
@@ -194,6 +237,13 @@ func BuildUpdateMessage(withdraw bool, attrs PathAttrs, routes []Route, opts Enc
 		}
 		pa = append(pa, psid)
 	}
+	if attrs.PMSITunnel != nil {
+		pmsi, err := attrs.PMSITunnel.buildAttr()
+		if err != nil {
+			return nil, err
+		}
+		pa = append(pa, pmsi)
+	}
 
 	return bgp.NewBGPUpdateMessage(nil, pa, nil), nil
 }
@@ -237,6 +287,13 @@ func buildIPv4UnicastUpdate(withdraw bool, attrs PathAttrs, nlris []bgp.PathNLRI
 			return nil, err
 		}
 		pa = append(pa, psid)
+	}
+	if attrs.PMSITunnel != nil {
+		pmsi, err := attrs.PMSITunnel.buildAttr()
+		if err != nil {
+			return nil, err
+		}
+		pa = append(pa, pmsi)
 	}
 	return bgp.NewBGPUpdateMessage(nil, pa, nlris), nil
 }

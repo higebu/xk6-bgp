@@ -170,8 +170,9 @@ goroutine, so blocking in one VU does not block others.
 | `origin` | number | ORIGIN attribute: `0` IGP, `1` EGP, `2` INCOMPLETE (`advertise` only, default `0`) |
 | `med` | number | MULTI_EXIT_DISC (`advertise` only) |
 | `localPref` | number | LOCAL_PREF for iBGP (`advertise` only) |
-| `extCommunities` | string[] | EXTENDED_COMMUNITIES entries ([RFC 4360](https://www.rfc-editor.org/rfc/rfc4360.txt)). Each string may carry an optional type prefix (`rt:` / `soo:`); a bare value defaults to Route-Target. See per-family doc for when this is required |
+| `extCommunities` | string[] | EXTENDED_COMMUNITIES entries ([RFC 4360](https://www.rfc-editor.org/rfc/rfc4360.txt)). Each string may carry an optional type prefix (`rt:` / `soo:` / `encap:` / `routermac:`); a bare value defaults to Route-Target. `encap:vxlan` etc. emit the Encapsulation EC ([RFC 9012](https://www.rfc-editor.org/rfc/rfc9012.txt)); `routermac:<MAC>` emits the EVPN Router's MAC EC ([RFC 9135 § 9](https://www.rfc-editor.org/rfc/rfc9135.txt)) |
 | `srv6L3Service` | object | SRv6 L3 Service TLV ([RFC 9252](https://www.rfc-editor.org/rfc/rfc9252.txt)); see [`docs/srv6_l3vpn.md`](./docs/srv6_l3vpn.md) |
+| `pmsiTunnel` | object | PMSI Tunnel attribute ([RFC 6514](https://www.rfc-editor.org/rfc/rfc6514.txt)). Shape: `{ tunnel: 'ingress-repl' \| <num>, label, endpoint, isLeafInfoRequired? }`. For EVPN Type 3 with VXLAN, set `tunnel: 'ingress-repl'`, `label: <VNI>`, `endpoint: <egress PE IP>` per [RFC 8365 § 5.1.3](https://www.rfc-editor.org/rfc/rfc8365.txt) |
 | `useMpReach` | boolean | Force IPv4-unicast through `MP_REACH_NLRI` instead of the UPDATE NLRI field |
 | `useExtendedMessages` | boolean | Chunk UPDATEs up to the RFC 8654 65535-byte limit. The peer **must** have advertised capability 6 — `advertise`/`withdraw` returns an error otherwise (see [Capabilities](#capabilities)) |
 | `updateRate` | number | Cap the per-Peer UPDATE send rate at this many messages per second (`0` = unlimited) |
@@ -201,6 +202,7 @@ rendezvous if a script needs to barrier multiple times.
 | `ipv6-unicast` | 1 | prefix string or `{ prefix }` | [RFC 4760](https://www.rfc-editor.org/rfc/rfc4760.txt) | — | [`examples/ipv6_unicast.js`](./examples/ipv6_unicast.js) |
 | `ipv4-mup` / `ipv6-mup` | 85 | `{ type, rd, ... }` | [draft-mpmz-bess-mup-safi](https://datatracker.ietf.org/doc/draft-mpmz-bess-mup-safi/) | [`docs/mup.md`](./docs/mup.md) | [`examples/mup.js`](./examples/mup.js) |
 | `l3vpn-ipv4` / `l3vpn-ipv6` | 128 | `{ rd, prefix }` (+ `srv6L3Service` on advertise) | [RFC 4364](https://www.rfc-editor.org/rfc/rfc4364.txt), [RFC 9252](https://www.rfc-editor.org/rfc/rfc9252.txt) | [`docs/srv6_l3vpn.md`](./docs/srv6_l3vpn.md) | [`examples/srv6_l3vpn.js`](./examples/srv6_l3vpn.js) |
+| `l2vpn-evpn` | 70 | `{ type: 'mac-ip' \| 'imet' \| 'ip-prefix', rd, ... }` | [RFC 7432](https://www.rfc-editor.org/rfc/rfc7432.txt), [RFC 9136](https://www.rfc-editor.org/rfc/rfc9136.txt) | [`docs/evpn.md`](./docs/evpn.md) | [`examples/evpn.js`](./examples/evpn.js) |
 
 ## Metrics
 
