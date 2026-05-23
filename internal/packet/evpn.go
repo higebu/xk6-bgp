@@ -55,7 +55,7 @@ func NewEVPNMacIPRoute(rd bgp.RouteDistinguisherInterface, esi bgp.EthernetSegme
 	var ipLen uint8
 	if ip.IsValid() {
 		ip = ip.Unmap()
-		ipLen = uint8(ip.BitLen())
+		ipLen = uint8(ip.BitLen()) // #nosec G115 -- netip.Addr.BitLen() returns 0, 32, or 128
 		if ipLen != 32 && ipLen != 128 {
 			return EVPNRoute{}, fmt.Errorf("evpn mac-ip: ip must be IPv4 or IPv6 (got %s)", ip)
 		}
@@ -124,7 +124,8 @@ func NewEVPNIPPrefixRoute(rd bgp.RouteDistinguisherInterface, esi bgp.EthernetSe
 			return EVPNRoute{}, fmt.Errorf("evpn ip-prefix: gateway %s does not match prefix family %s", gw, prefix)
 		}
 	}
-	nlri, err := bgp.NewEVPNIPPrefixRoute(rd, esi, ethTag, uint8(prefix.Bits()), addr, gw, label)
+	prefixLen := uint8(prefix.Bits()) // #nosec G115 -- netip.Prefix.Bits() returns 0..128 (validated by IsValid above)
+	nlri, err := bgp.NewEVPNIPPrefixRoute(rd, esi, ethTag, prefixLen, addr, gw, label)
 	if err != nil {
 		return EVPNRoute{}, fmt.Errorf("evpn ip-prefix: %w", err)
 	}
