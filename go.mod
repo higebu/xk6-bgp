@@ -2,7 +2,7 @@ module github.com/higebu/xk6-bgp
 
 go 1.25.0
 
-toolchain go1.25.10
+toolchain go1.25.12
 
 retract v0.1.0
 
