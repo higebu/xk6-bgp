@@ -70,6 +70,7 @@ func main() {
 	rid := flag.String("router-id", "10.0.0.2", "router-id")
 	reflectMode := flag.Bool("reflect", false, "re-broadcast UPDATEs to all other connected sessions")
 	famsFlag := flag.String("families", "ipv4-unicast", "comma-separated AFI/SAFI to advertise")
+	addPath := flag.Bool("addpath", false, "advertise RFC 7911 ADD-PATH send/receive for all families")
 	flag.Parse()
 
 	families, err := parseFamilies(*famsFlag)
@@ -81,8 +82,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("fakebgpd listening on %s as AS %d families=%v reflectMode=%v",
-		*addr, *myAS, *famsFlag, *reflectMode)
+	log.Printf("fakebgpd listening on %s as AS %d families=%v reflectMode=%v addPath=%v",
+		*addr, *myAS, *famsFlag, *reflectMode, *addPath)
 
 	h := &hub{clients: map[*session]struct{}{}}
 
@@ -91,7 +92,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		go handleConn(conn, h, uint32(*myAS), *rid, families, *reflectMode) // #nosec G115 -- AS values are bounded by RFC 6793; out-of-range is a CLI misuse, not a vulnerability
+		go handleConn(conn, h, uint32(*myAS), *rid, families, *reflectMode, *addPath) // #nosec G115 -- AS values are bounded by RFC 6793; out-of-range is a CLI misuse, not a vulnerability
 	}
 }
 
@@ -115,24 +116,39 @@ func parseFamilies(s string) ([]bgp.Family, error) {
 	return out, nil
 }
 
-func handleConn(conn net.Conn, h *hub, myAS uint32, rid string, families []bgp.Family, reflectMode bool) {
+func handleConn(conn net.Conn, h *hub, myAS uint32, rid string, families []bgp.Family, reflectMode, addPath bool) {
 	defer conn.Close()
 	log.Printf("accepted %s", conn.RemoteAddr())
 
+	var peerOpen *bgp.BGPOpen
 	if _, msg, err := xpeer.ReadMessage(conn); err != nil {
 		log.Printf("%s: read OPEN: %v", conn.RemoteAddr(), err)
 		return
-	} else if _, ok := msg.Body.(*bgp.BGPOpen); !ok {
+	} else if po, ok := msg.Body.(*bgp.BGPOpen); ok {
+		peerOpen = po
+	} else {
 		log.Printf("%s: expected OPEN, got %T", conn.RemoteAddr(), msg.Body)
 		return
 	}
 
-	open, err := xpeer.BuildOpen(myAS, 90*time.Second, netip.MustParseAddr(rid), packet.CapsConfig{
+	caps := packet.CapsConfig{
 		Families:        families,
 		FourOctetAS:     myAS,
 		RouteRefresh:    true,
 		ExtendedMessage: true,
-	})
+	}
+	var rxOpts []*bgp.MarshallingOption
+	if addPath {
+		caps.AddPath = make(map[bgp.Family]bgp.BGPAddPathMode, len(families))
+		for _, f := range families {
+			caps.AddPath[f] = bgp.BGP_ADD_PATH_BOTH
+		}
+		if modes := addPathReceiveModes(peerOpen); len(modes) > 0 {
+			rxOpts = []*bgp.MarshallingOption{{AddPath: modes}}
+		}
+	}
+
+	open, err := xpeer.BuildOpen(myAS, 90*time.Second, netip.MustParseAddr(rid), caps)
 	if err != nil {
 		log.Printf("%s: BuildOpen: %v", conn.RemoteAddr(), err)
 		return
@@ -175,7 +191,7 @@ func handleConn(conn net.Conn, h *hub, myAS uint32, rid string, families []bgp.F
 
 	updates := 0
 	for {
-		raw, msg, err := xpeer.ReadMessage(conn)
+		raw, msg, err := xpeer.ReadMessage(conn, rxOpts...)
 		if err != nil {
 			log.Printf("%s: read: %v (UPDATEs=%d)", conn.RemoteAddr(), err, updates)
 			return
@@ -193,6 +209,38 @@ func handleConn(conn net.Conn, h *hub, myAS uint32, rid string, families []bgp.F
 			return
 		}
 	}
+}
+
+// addPathReceiveModes returns the per-family decode option for a
+// client that advertised ADD-PATH send: inbound NLRI from it carry
+// Path Identifiers, so fakebgpd must parse with receive enabled.
+// Reflection is unaffected — the raw bytes are re-sent verbatim, which
+// is only wire-correct when every connected client negotiated the same
+// ADD-PATH families (run all example Peers with matching capabilities).
+func addPathReceiveModes(open *bgp.BGPOpen) map[bgp.Family]bgp.BGPAddPathMode {
+	var modes map[bgp.Family]bgp.BGPAddPathMode
+	for _, p := range open.OptParams {
+		ocp, ok := p.(*bgp.OptionParameterCapability)
+		if !ok {
+			continue
+		}
+		for _, c := range ocp.Capability {
+			ap, ok := c.(*bgp.CapAddPath)
+			if !ok {
+				continue
+			}
+			for _, t := range ap.Tuples {
+				if t.Mode&bgp.BGP_ADD_PATH_SEND == 0 {
+					continue
+				}
+				if modes == nil {
+					modes = map[bgp.Family]bgp.BGPAddPathMode{}
+				}
+				modes[t.Family] |= bgp.BGP_ADD_PATH_RECEIVE
+			}
+		}
+	}
+	return modes
 }
 
 func describeUpdate(remote net.Addr, n int, u *bgp.BGPUpdate) {

@@ -24,6 +24,11 @@ type CapsConfig struct {
 	ExtendedMessage bool // RFC 8654
 	GracefulRestart *GRConfig
 	EnhancedRefresh bool // RFC 7313
+	// AddPath holds the per-family RFC 7911 Send/Receive value to
+	// advertise (1 receive, 2 send, 3 both). Families absent from the
+	// map do not appear in the ADD-PATH capability. Every key must also
+	// be present in Families.
+	AddPath map[bgp.Family]bgp.BGPAddPathMode
 }
 
 // BGPCapExtendedMessage is RFC 8654 capability code 6. gobgp v4 has no
@@ -67,6 +72,29 @@ func BuildCapabilities(c CapsConfig) ([]bgp.ParameterCapabilityInterface, error)
 			CapCode: BGPCapExtendedMessage,
 		})
 	}
+	if len(c.AddPath) > 0 {
+		advertised := make(map[bgp.Family]struct{}, len(c.Families))
+		for _, f := range c.Families {
+			advertised[f] = struct{}{}
+		}
+		for f, m := range c.AddPath {
+			if m < bgp.BGP_ADD_PATH_RECEIVE || m > bgp.BGP_ADD_PATH_BOTH {
+				return nil, fmt.Errorf("addPath: invalid Send/Receive value %d for %s (RFC 7911 section 4 allows 1-3)", m, f)
+			}
+			if _, ok := advertised[f]; !ok {
+				return nil, fmt.Errorf("addPath: family %s is not in the advertised families", f)
+			}
+		}
+		// Iterate Families, not the map, so the tuple order in the
+		// serialized capability is deterministic.
+		tuples := make([]*bgp.CapAddPathTuple, 0, len(c.AddPath))
+		for _, f := range c.Families {
+			if m, ok := c.AddPath[f]; ok {
+				tuples = append(tuples, bgp.NewCapAddPathTuple(f, m))
+			}
+		}
+		caps = append(caps, bgp.NewCapAddPath(tuples))
+	}
 	if gr := c.GracefulRestart; gr != nil {
 		tuples := make([]*bgp.CapGracefulRestartTuple, 0, len(c.Families))
 		for _, f := range c.Families {
@@ -76,6 +104,20 @@ func BuildCapabilities(c CapsConfig) ([]bgp.ParameterCapabilityInterface, error)
 	}
 
 	return caps, nil
+}
+
+// ResolveAddPathMode maps the user-facing mode names onto RFC 7911
+// section 4 Send/Receive values.
+func ResolveAddPathMode(name string) (bgp.BGPAddPathMode, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "receive":
+		return bgp.BGP_ADD_PATH_RECEIVE, nil
+	case "send":
+		return bgp.BGP_ADD_PATH_SEND, nil
+	case "both":
+		return bgp.BGP_ADD_PATH_BOTH, nil
+	}
+	return 0, fmt.Errorf("unknown addPath mode %q (want receive, send, or both)", name)
 }
 
 func ResolveFamily(name string) (bgp.Family, error) {

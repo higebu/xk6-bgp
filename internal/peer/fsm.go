@@ -85,10 +85,15 @@ type fsm struct {
 	peerCaps                   []bgp.ParameterCapabilityInterface
 	extendedMessagesNegotiated bool
 	fourOctetASNegotiated      bool
-	// msgOpts carries the negotiation outcome (2-octet AS_PATH
-	// handling) into every gobgp Serialize/Parse call. Built once in
-	// acceptPeerOpen; nil on the default 4-octet-AS session so the hot
-	// path stays allocation-free.
+	// addPathNegotiated is the effective per-family RFC 7911 mode:
+	// send is set when we advertised send and the peer advertised
+	// receive, receive when we advertised receive and the peer
+	// advertised send. nil when ADD-PATH is not in play.
+	addPathNegotiated map[bgp.Family]bgp.BGPAddPathMode
+	// msgOpts carries the negotiation outcome (ADD-PATH modes, 2-octet
+	// AS_PATH decoding) into every gobgp Serialize/Parse call. Built
+	// once in acceptPeerOpen; nil on the default 4-octet-AS,
+	// no-ADD-PATH session so the hot path stays allocation-free.
 	msgOpts []*bgp.MarshallingOption
 
 	loopCtx    context.Context
@@ -274,6 +279,7 @@ func (f *fsm) acceptPeerOpen(m *bgp.BGPOpen) error {
 	}
 
 	f.peerAS = uint32(m.MyAS)
+	var peerAddPath map[bgp.Family]bgp.BGPAddPathMode
 	for _, p := range m.OptParams {
 		ocp, ok := p.(*bgp.OptionParameterCapability)
 		if !ok {
@@ -289,12 +295,42 @@ func (f *fsm) acceptPeerOpen(m *bgp.BGPOpen) error {
 			if c.Code() == packet.BGPCapExtendedMessage && f.cfg.Caps.ExtendedMessage {
 				f.extendedMessagesNegotiated = true
 			}
+			if ap, ok := c.(*bgp.CapAddPath); ok {
+				if peerAddPath == nil {
+					peerAddPath = make(map[bgp.Family]bgp.BGPAddPathMode, len(ap.Tuples))
+				}
+				for _, t := range ap.Tuples {
+					peerAddPath[t.Family] |= t.Mode
+				}
+			}
 			f.peerCaps = append(f.peerCaps, c)
 		}
 	}
 
-	if !f.fourOctetASNegotiated {
-		f.msgOpts = []*bgp.MarshallingOption{{Use2ByteAS: true}}
+	// RFC 7911 section 5: each direction is enabled independently —
+	// we may send additional paths for a family only if we advertised
+	// send and the peer advertised receive, and vice versa.
+	for fam, local := range f.cfg.Caps.AddPath {
+		peerMode := peerAddPath[fam]
+		var mode bgp.BGPAddPathMode
+		if local&bgp.BGP_ADD_PATH_SEND != 0 && peerMode&bgp.BGP_ADD_PATH_RECEIVE != 0 {
+			mode |= bgp.BGP_ADD_PATH_SEND
+		}
+		if local&bgp.BGP_ADD_PATH_RECEIVE != 0 && peerMode&bgp.BGP_ADD_PATH_SEND != 0 {
+			mode |= bgp.BGP_ADD_PATH_RECEIVE
+		}
+		if mode != 0 {
+			if f.addPathNegotiated == nil {
+				f.addPathNegotiated = make(map[bgp.Family]bgp.BGPAddPathMode, len(f.cfg.Caps.AddPath))
+			}
+			f.addPathNegotiated[fam] = mode
+		}
+	}
+	if f.addPathNegotiated != nil || !f.fourOctetASNegotiated {
+		f.msgOpts = []*bgp.MarshallingOption{{
+			AddPath:    f.addPathNegotiated,
+			Use2ByteAS: !f.fourOctetASNegotiated,
+		}}
 	}
 
 	if f.cfg.PeerAS != 0 && f.peerAS != f.cfg.PeerAS {

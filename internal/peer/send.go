@@ -47,6 +47,13 @@ type AdvertiseResult struct {
 // with `Bad Message Length`.
 var ErrExtendedMessagesNotNegotiated = errors.New("xk6-bgp: useExtendedMessages requires the peer to have advertised RFC 8654 capability 6")
 
+// ErrAddPathNotNegotiated is returned by Advertise / Withdraw when a
+// route carries an RFC 7911 Path Identifier but ADD-PATH send was not
+// negotiated for the family — the peer would misparse the NLRI field
+// if the 4-octet ID were emitted, and silently dropping the ID would
+// collapse the caller's multiple paths into one.
+var ErrAddPathNotNegotiated = errors.New("xk6-bgp: pathId requires the ADD-PATH send direction to be negotiated for the family (RFC 7911)")
+
 func (p *Peer) Advertise(req AdvertiseRequest) (AdvertiseResult, error) {
 	if p.fsm == nil || p.fsm.State() != StateEstablished {
 		return AdvertiseResult{}, ErrSessionNotReady
@@ -59,6 +66,9 @@ func (p *Peer) Advertise(req AdvertiseRequest) (AdvertiseResult, error) {
 	}
 	if req.Encoding.UseExtendedMessages && !p.fsm.extendedMessagesNegotiated {
 		return AdvertiseResult{}, ErrExtendedMessagesNotNegotiated
+	}
+	if err := p.fsm.validatePathIDs(req.Family, req.Routes); err != nil {
+		return AdvertiseResult{}, fmt.Errorf("advertise: %w", err)
 	}
 	ts, sent, err := p.fsm.writeUpdates(false, req.Attrs, req.Routes, req.Encoding, req.UpdateRate)
 	if err != nil {
@@ -79,6 +89,9 @@ func (p *Peer) Withdraw(req WithdrawRequest) (AdvertiseResult, error) {
 	}
 	if req.Encoding.UseExtendedMessages && !p.fsm.extendedMessagesNegotiated {
 		return AdvertiseResult{}, ErrExtendedMessagesNotNegotiated
+	}
+	if err := p.fsm.validatePathIDs(req.Family, req.Routes); err != nil {
+		return AdvertiseResult{}, fmt.Errorf("withdraw: %w", err)
 	}
 	ts, sent, err := p.fsm.writeUpdates(true, packet.PathAttrs{}, req.Routes, req.Encoding, req.UpdateRate)
 	if err != nil {
@@ -101,6 +114,22 @@ func validateRouteFamily(want bgp.Family, routes []packet.Route) error {
 	return nil
 }
 
+// validatePathIDs rejects routes carrying an RFC 7911 Path Identifier
+// when ADD-PATH send was not negotiated for the family. Routes without
+// a pathId are always fine — with ADD-PATH active they go out with
+// Path Identifier 0.
+func (f *fsm) validatePathIDs(fam bgp.Family, routes []packet.Route) error {
+	if f.addPathNegotiated[fam]&bgp.BGP_ADD_PATH_SEND != 0 {
+		return nil
+	}
+	for i, r := range routes {
+		if _, ok := r.(packet.PathIDRoute); ok {
+			return fmt.Errorf("routes[%d]: %w", i, ErrAddPathNotNegotiated)
+		}
+	}
+	return nil
+}
+
 // writeUpdates serializes routes into one or more UPDATE messages,
 // each within BGP_MAX_MESSAGE_LENGTH, and writes them atomically with
 // respect to other writers (the keepalive goroutine in particular).
@@ -112,8 +141,9 @@ func (f *fsm) writeUpdates(withdraw bool, attrs packet.PathAttrs, routes []packe
 		return timing.Timestamp{}, 0, nil
 	}
 	// The negotiation outcome overrides whatever the caller put in the
-	// encoding: the AS_PATH octet size is a session property, not a
-	// per-advertise choice.
+	// encoding: ADD-PATH modes and the AS_PATH octet size are session
+	// properties, not per-advertise choices.
+	encoding.AddPath = f.addPathNegotiated
 	encoding.Use2ByteAS = !f.fourOctetASNegotiated
 	chunks, err := packet.ChunkRoutes(withdraw, attrs, routes, encoding)
 	if err != nil {

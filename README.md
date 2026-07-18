@@ -81,6 +81,7 @@ various scenarios:
 - [`smoke.js`](./examples/smoke.js) — minimal one-peer advertise/withdraw smoke test
 - [`ipv4_unicast.js`](./examples/ipv4_unicast.js) — IPv4-unicast UPDATE delivery between two Peers
 - [`ipv6_unicast.js`](./examples/ipv6_unicast.js) — IPv6-unicast variant
+- [`ipv4_addpath.js`](./examples/ipv4_addpath.js) — RFC 7911 ADD-PATH delivery of multiple paths per prefix
 - [`mup.js`](./examples/mup.js) — `ipv4-mup` advertise of all four MUP route types
 - [`srv6_l3vpn.js`](./examples/srv6_l3vpn.js) — `l3vpn-ipv4` advertise with RT + SRv6 L3 Service TLV (End.DT4 SID)
 - [`throughput.js`](./examples/throughput.js) — single-peer advertise throughput sweep over `COUNT` prefixes
@@ -121,6 +122,17 @@ Negotiated by default in OPEN:
 - Graceful Restart with N-bit ([RFC 4724](https://www.rfc-editor.org/rfc/rfc4724.txt) + [RFC 8538](https://www.rfc-editor.org/rfc/rfc8538.txt))
 - 4-octet AS ([RFC 6793](https://www.rfc-editor.org/rfc/rfc6793.txt))
 
+Opt-in via `capabilities`:
+
+- ADD-PATH ([RFC 7911](https://www.rfc-editor.org/rfc/rfc7911.txt)) —
+  `addPath: { '<family>': 'receive' | 'send' | 'both' }` per family.
+  Each direction takes effect only when the peer advertised the
+  matching opposite direction. With receive negotiated, observed-set
+  keys become `"<prefix>:<pathId>"` for that family (see
+  `waitForPrefixes`); with send negotiated, routes may carry a
+  `pathId` (routes without one go out as Path Identifier `0`), and a
+  `pathId` on a session that did not negotiate send is an error.
+
 When a peer does not advertise the 4-octet AS capability, xk6-bgp
 follows [RFC 6793 § 4.2.2](https://www.rfc-editor.org/rfc/rfc6793.txt):
 AS_PATH is sent with 2-octet AS numbers (a non-mappable local AS
@@ -146,7 +158,7 @@ goroutine, so blocking in one VU does not block others.
 | `families` | string[] | — | AFI/SAFI list, e.g. `['ipv4-unicast', 'ipv6-unicast']` (required) |
 | `localAddress` | string | unset | Source IP for the outbound TCP connection; used by `throughput.js` / `multi_peer.js` to drive many sessions from distinct loopback aliases |
 | `timers` | object | defaults | `{ keepalive, holdtime, connectRetry, openTimeout }` as k6 duration strings |
-| `capabilities` | object | see note | Per-capability overrides: `{ extendedMessage, routeRefresh, enhancedRouteRefresh, gracefulRestart }`. `extendedMessage`, `routeRefresh`, and `gracefulRestart` default on; `enhancedRouteRefresh` defaults off |
+| `capabilities` | object | see note | Per-capability overrides: `{ extendedMessage, routeRefresh, enhancedRouteRefresh, gracefulRestart, addPath }`. `extendedMessage`, `routeRefresh`, and `gracefulRestart` default on; `enhancedRouteRefresh` and `addPath` default off. `addPath` maps family strings to `'receive'` / `'send'` / `'both'` (see [Capabilities](#capabilities)) |
 | `tags` | object | unset | Key-value pairs added to every metric this Peer emits. `tags.peer` becomes the `peer` label |
 
 ### Methods
@@ -172,7 +184,7 @@ goroutine, so blocking in one VU does not block others.
 | `family` | string | AFI/SAFI declared in `peer.families` (required) |
 | `nextHop` | string | IPv4 or IPv6 next-hop (required for `advertise`) |
 | `localAs` | number | AS_PATH origin AS (required for `advertise`) |
-| `routes` | string[] \| object[] | Prefix strings (`['10.0.0.0/24']`) or family-specific descriptor objects — see [Supported AFI/SAFI](#supported-afisafi) (required) |
+| `routes` | string[] \| object[] | Prefix strings (`['10.0.0.0/24']`) or family-specific descriptor objects — see [Supported AFI/SAFI](#supported-afisafi) (required). Any object form additionally accepts `pathId` (RFC 7911 Path Identifier; requires ADD-PATH send negotiated for the family) |
 | `origin` | number | ORIGIN attribute: `0` IGP, `1` EGP, `2` INCOMPLETE (`advertise` only, default `0`) |
 | `med` | number | MULTI_EXIT_DISC (`advertise` only) |
 | `localPref` | number | LOCAL_PREF for iBGP (`advertise` only) |
@@ -187,7 +199,7 @@ goroutine, so blocking in one VU does not block others.
 
 | Field | Type | Description |
 |---|---|---|
-| `prefixes` | (string \| object)[] | Expected route set: prefix strings or family-specific descriptor objects (same shape as `advertise.routes` — see [Supported AFI/SAFI](#supported-afisafi)) (required) |
+| `prefixes` | (string \| object)[] | Expected route set: prefix strings or family-specific descriptor objects (same shape as `advertise.routes` — see [Supported AFI/SAFI](#supported-afisafi)) (required). With ADD-PATH receive negotiated for the family, keys carry the Path Identifier: append `:<pathId>` to a prefix string (`'10.0.0.0/24:1'`) or set `pathId` on a descriptor object |
 | `timeout` | string \| number | k6 duration string or seconds; throws if not met before this |
 | `sentAtMonoNs` | number | Filter observations that predate this mono-ns timestamp, and anchor the `bgp_prefix_received_duration` sample (typically `advertise.sentAtMonoNs`) |
 

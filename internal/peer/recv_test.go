@@ -35,7 +35,7 @@ func TestObservedSetAdvertiseWithdraw(t *testing.T) {
 	o := newObservedSet()
 	t0 := timing.Now()
 
-	o.applyUpdate(bgp.RF_IPv4_UC, t0, mustPathNLRIs(t, "10.0.0.0/24", "10.0.1.0/24"), nil)
+	o.applyUpdate(bgp.RF_IPv4_UC, false, t0, mustPathNLRIs(t, "10.0.0.0/24", "10.0.1.0/24"), nil)
 
 	if _, seen := o.firstSeen["10.0.0.0/24"]; !seen {
 		t.Fatalf("10.0.0.0/24 not advertised")
@@ -48,7 +48,7 @@ func TestObservedSetAdvertiseWithdraw(t *testing.T) {
 	}
 
 	t1 := timing.Now()
-	o.applyUpdate(bgp.RF_IPv4_UC, t1, nil, mustPathNLRIs(t, "10.0.0.0/24"))
+	o.applyUpdate(bgp.RF_IPv4_UC, false, t1, nil, mustPathNLRIs(t, "10.0.0.0/24"))
 	if _, gone := o.withdrawn["10.0.0.0/24"]; !gone {
 		t.Fatalf("10.0.0.0/24 should be withdrawn")
 	}
@@ -172,7 +172,7 @@ func TestWaitForPrefixes_Synchronous(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		time.Sleep(10 * time.Millisecond)
-		o.applyUpdate(bgp.RF_IPv4_UC, timing.Now(), mustPathNLRIs(t, wantPrefixes...), nil)
+		o.applyUpdate(bgp.RF_IPv4_UC, false, timing.Now(), mustPathNLRIs(t, wantPrefixes...), nil)
 	}()
 
 	res, err := p.WaitForPrefixes(wantPrefixes, 2*time.Second, timing.Timestamp{})
@@ -195,7 +195,7 @@ func TestWaitForPrefixes_Timeout(t *testing.T) {
 	p := &Peer{cfg: cfg, fsm: &fsm{observed: o}}
 	p.fsm.state.Store(int32(StateEstablished))
 
-	o.applyUpdate(bgp.RF_IPv4_UC, timing.Now(), mustPathNLRIs(t, "10.10.0.0/24"), nil)
+	o.applyUpdate(bgp.RF_IPv4_UC, false, timing.Now(), mustPathNLRIs(t, "10.10.0.0/24"), nil)
 	res, err := p.WaitForPrefixes([]string{"10.10.0.0/24", "10.10.99.0/24"}, 50*time.Millisecond, timing.Timestamp{})
 	if err == nil {
 		t.Fatalf("expected timeout, got nil err, res=%+v", res)
@@ -213,7 +213,7 @@ func TestWaitForPrefixes_OnlyAfter(t *testing.T) {
 	p.fsm.state.Store(int32(StateEstablished))
 
 	// Old observation that should be ignored.
-	o.applyUpdate(bgp.RF_IPv4_UC, timing.Now(), mustPathNLRIs(t, "10.10.0.0/24"), nil)
+	o.applyUpdate(bgp.RF_IPv4_UC, false, timing.Now(), mustPathNLRIs(t, "10.10.0.0/24"), nil)
 
 	time.Sleep(5 * time.Millisecond)
 	cutoff := timing.Now()
@@ -221,7 +221,7 @@ func TestWaitForPrefixes_OnlyAfter(t *testing.T) {
 	// Same prefix re-observed *after* cutoff in a goroutine.
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		o.applyUpdate(bgp.RF_IPv4_UC, timing.Now(), mustPathNLRIs(t, "10.10.0.0/24"), nil)
+		o.applyUpdate(bgp.RF_IPv4_UC, false, timing.Now(), mustPathNLRIs(t, "10.10.0.0/24"), nil)
 	}()
 
 	// FirstSeen is sticky, so onlyAfter must NOT pass with old timestamp.
@@ -380,6 +380,97 @@ func TestDispatch_KnownBytes_VPNv4MPReach(t *testing.T) {
 	}
 	if _, ok := o.firstSeen["65000:1:10.1.0.0/24"]; !ok {
 		t.Fatalf("VPNv4 NLRI not observed under expected key; got %v", mapKeys(o.firstSeen))
+	}
+}
+
+// dispatchRawAddPath is dispatchRaw for a session that negotiated
+// ADD-PATH receive for the given families: the parse gets the matching
+// MarshallingOption and the fsm carries the negotiated modes.
+func dispatchRawAddPath(t *testing.T, raw []byte, fams ...bgp.Family) *observedSet {
+	t.Helper()
+	modes := make(map[bgp.Family]bgp.BGPAddPathMode, len(fams))
+	for _, fam := range fams {
+		modes[fam] = bgp.BGP_ADD_PATH_RECEIVE
+	}
+	msg, err := bgp.ParseBGPMessage(raw, &bgp.MarshallingOption{AddPath: modes})
+	if err != nil {
+		t.Fatalf("ParseBGPMessage: %v", err)
+	}
+	upd, ok := msg.Body.(*bgp.BGPUpdate)
+	if !ok {
+		t.Fatalf("parsed %T, want *bgp.BGPUpdate", msg.Body)
+	}
+	f := &fsm{observed: newObservedSet(), addPathNegotiated: modes}
+	f.dispatchUpdate(upd, timing.Now())
+	return f.observed
+}
+
+// TestDispatch_KnownBytes_IPv4UnicastAddPath decodes a byte-literal
+// RFC 7911 UPDATE carrying the same prefix twice under Path
+// Identifiers 1 and 2. Both must be recorded as distinct routes under
+// "<prefix>:<path-id>" keys.
+func TestDispatch_KnownBytes_IPv4UnicastAddPath(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x3b, // length 59
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x14, // total path attribute length 20
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 4-octet AS
+		0x40, 0x03, 0x04, 0x0a, 0x00, 0x00, 0x01, // NEXT_HOP 10.0.0.1
+		0x00, 0x00, 0x00, 0x01, 0x18, 0x0a, 0x01, 0x00, // path-id 1, 10.1.0.0/24
+		0x00, 0x00, 0x00, 0x02, 0x18, 0x0a, 0x01, 0x00, // path-id 2, 10.1.0.0/24
+	)
+	o := dispatchRawAddPath(t, raw, bgp.RF_IPv4_UC)
+	for _, want := range []string{"10.1.0.0/24:1", "10.1.0.0/24:2"} {
+		if _, ok := o.firstSeen[want]; !ok {
+			t.Errorf("path %s not observed; got %v", want, mapKeys(o.firstSeen))
+		}
+	}
+	if len(o.firstSeen) != 2 {
+		t.Errorf("observed %d routes, want 2: %v", len(o.firstSeen), mapKeys(o.firstSeen))
+	}
+}
+
+// TestDispatch_KnownBytes_IPv4WithdrawAddPath decodes a byte-literal
+// UPDATE withdrawing one specific path of a prefix.
+func TestDispatch_KnownBytes_IPv4WithdrawAddPath(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x1f, // length 31
+		0x02,       // type UPDATE
+		0x00, 0x08, // withdrawn routes length 8
+		0x00, 0x00, 0x00, 0x01, 0x18, 0x0a, 0x01, 0x00, // path-id 1, withdraw 10.1.0.0/24
+		0x00, 0x00, // total path attribute length 0
+	)
+	o := dispatchRawAddPath(t, raw, bgp.RF_IPv4_UC)
+	if _, ok := o.withdrawn["10.1.0.0/24:1"]; !ok {
+		t.Fatalf("10.1.0.0/24:1 not marked withdrawn")
+	}
+}
+
+// TestDispatch_KnownBytes_IPv6MPReachAddPath decodes a byte-literal
+// RFC 4760 + RFC 7911 UPDATE carrying 2001:db8:1::/64 under Path
+// Identifier 5 in MP_REACH_NLRI.
+func TestDispatch_KnownBytes_IPv6MPReachAddPath(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x49, // length 73
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x32, // total path attribute length 50
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 4-octet AS
+		0x80, 0x0e, 0x22, // MP_REACH_NLRI, length 34
+		0x00, 0x02, 0x01, // AFI 2 (IPv6) / SAFI 1 (unicast)
+		0x10, // next-hop length 16
+		0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // 2001:db8::1
+		0x00,                   // reserved
+		0x00, 0x00, 0x00, 0x05, // path-id 5
+		0x40, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0x00, 0x00, // 2001:db8:1::/64
+	)
+	o := dispatchRawAddPath(t, raw, bgp.RF_IPv6_UC)
+	if _, ok := o.firstSeen["2001:db8:1::/64:5"]; !ok {
+		t.Fatalf("2001:db8:1::/64:5 not observed; got %v", mapKeys(o.firstSeen))
 	}
 }
 

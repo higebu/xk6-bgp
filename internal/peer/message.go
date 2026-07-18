@@ -71,8 +71,8 @@ func ReadMessage(r io.Reader, options ...*bgp.MarshallingOption) ([]byte, *bgp.B
 // message is read, before ParseBGPMessage — for a large UPDATE the
 // parse cost must not leak into bgp_prefix_received_duration.
 // options must carry the session's negotiated MarshallingOption when
-// a 2-octet-AS peer is in play, otherwise the AS_PATH bytes are
-// misparsed.
+// ADD-PATH receive or a 2-octet-AS peer is in play, otherwise the NLRI
+// or AS_PATH bytes are misparsed.
 func ReadMessageMax(r io.Reader, maxLen int, options ...*bgp.MarshallingOption) ([]byte, *bgp.BGPMessage, timing.Timestamp, error) {
 	var hdr [bgp.BGP_HEADER_LENGTH]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {

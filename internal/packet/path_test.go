@@ -433,6 +433,91 @@ func TestBuildUpdateMessage_MPFamilyNoNextHopAttr(t *testing.T) {
 	}
 }
 
+// TestBuildUpdateMessage_AddPathIPv4RoundTrip serializes two paths for
+// the same IPv4 prefix with ADD-PATH send enabled and re-parses them
+// with the receive-side option, checking the Path Identifiers survive
+// the traditional NLRI field.
+func TestBuildUpdateMessage_AddPathIPv4RoundTrip(t *testing.T) {
+	txOpts := EncodingOptions{
+		AddPath: map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_SEND},
+	}
+	routes := []Route{
+		WithPathID(MustIPRoute(bgp.RF_IPv4_UC, mustPrefix("10.100.0.0/24")), 1),
+		WithPathID(MustIPRoute(bgp.RF_IPv4_UC, mustPrefix("10.100.0.0/24")), 2),
+	}
+	msg, err := BuildUpdateMessage(false,
+		PathAttrs{NextHop: parseAddr("10.0.0.1"), LocalAS: 65001}, routes, txOpts)
+	if err != nil {
+		t.Fatalf("BuildUpdateMessage: %v", err)
+	}
+	buf, err := SerializeMessage(msg, txOpts)
+	if err != nil {
+		t.Fatalf("SerializeMessage: %v", err)
+	}
+	parsed, err := bgp.ParseBGPMessage(buf, &bgp.MarshallingOption{
+		AddPath: map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_RECEIVE},
+	})
+	if err != nil {
+		t.Fatalf("ParseBGPMessage: %v", err)
+	}
+	upd := parsed.Body.(*bgp.BGPUpdate)
+	if len(upd.NLRI) != 2 {
+		t.Fatalf("NLRI count = %d, want 2", len(upd.NLRI))
+	}
+	for i, wantID := range []uint32{1, 2} {
+		if upd.NLRI[i].ID != wantID || upd.NLRI[i].NLRI.String() != "10.100.0.0/24" {
+			t.Errorf("NLRI[%d] = %s id=%d, want 10.100.0.0/24 id=%d",
+				i, upd.NLRI[i].NLRI, upd.NLRI[i].ID, wantID)
+		}
+	}
+}
+
+// TestBuildUpdateMessage_AddPathIPv6MPReachRoundTrip does the same for
+// an MP_REACH_NLRI family.
+func TestBuildUpdateMessage_AddPathIPv6MPReachRoundTrip(t *testing.T) {
+	txOpts := EncodingOptions{
+		AddPath: map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv6_UC: bgp.BGP_ADD_PATH_SEND},
+	}
+	routes := []Route{
+		WithPathID(MustIPRoute(bgp.RF_IPv6_UC, mustPrefix("2001:db8:a::/48")), 7),
+		WithPathID(MustIPRoute(bgp.RF_IPv6_UC, mustPrefix("2001:db8:a::/48")), 8),
+	}
+	msg, err := BuildUpdateMessage(false,
+		PathAttrs{NextHop: parseAddr("2001:db8::1"), LocalAS: 65001}, routes, txOpts)
+	if err != nil {
+		t.Fatalf("BuildUpdateMessage: %v", err)
+	}
+	buf, err := SerializeMessage(msg, txOpts)
+	if err != nil {
+		t.Fatalf("SerializeMessage: %v", err)
+	}
+	parsed, err := bgp.ParseBGPMessage(buf, &bgp.MarshallingOption{
+		AddPath: map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv6_UC: bgp.BGP_ADD_PATH_RECEIVE},
+	})
+	if err != nil {
+		t.Fatalf("ParseBGPMessage: %v", err)
+	}
+	upd := parsed.Body.(*bgp.BGPUpdate)
+	var mpr *bgp.PathAttributeMpReachNLRI
+	for _, a := range upd.PathAttributes {
+		if v, ok := a.(*bgp.PathAttributeMpReachNLRI); ok {
+			mpr = v
+		}
+	}
+	if mpr == nil {
+		t.Fatal("MP_REACH_NLRI attribute missing")
+	}
+	if len(mpr.Value) != 2 {
+		t.Fatalf("MP_REACH NLRI count = %d, want 2", len(mpr.Value))
+	}
+	for i, wantID := range []uint32{7, 8} {
+		if mpr.Value[i].ID != wantID || mpr.Value[i].NLRI.String() != "2001:db8:a::/48" {
+			t.Errorf("Value[%d] = %s id=%d, want 2001:db8:a::/48 id=%d",
+				i, mpr.Value[i].NLRI, mpr.Value[i].ID, wantID)
+		}
+	}
+}
+
 // TestBuildUpdateMessage_Use2ByteAS checks RFC 6793 section 4.2.2
 // encoding toward an OLD (2-octet AS) peer: mappable local AS numbers
 // go into a 2-octet AS_PATH with no AS4_PATH; a non-mappable one
@@ -496,5 +581,54 @@ func TestBuildUpdateMessage_Use2ByteAS(t *testing.T) {
 				t.Fatal("AS4_PATH present for a mappable AS (RFC 6793 section 4.2.2 forbids it)")
 			}
 		})
+	}
+}
+
+// TestChunkRoutes_AddPath verifies the 4-octet Path Identifier is
+// budgeted per NLRI: every chunk must still serialize within
+// BGP_MAX_MESSAGE_LENGTH with ADD-PATH send enabled.
+func TestChunkRoutes_AddPath(t *testing.T) {
+	const n = 2000
+	opts := EncodingOptions{
+		AddPath: map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_SEND},
+	}
+	routes := make([]Route, 0, n)
+	for i := range n {
+		routes = append(routes, WithPathID(MustIPRoute(bgp.RF_IPv4_UC,
+			netip.PrefixFrom(
+				netip.AddrFrom4([4]byte{10, byte((i >> 16) & 0xff), byte((i >> 8) & 0xff), byte(i & 0xff)}), 32)),
+			uint32(i+1)))
+	}
+	attrs := PathAttrs{NextHop: parseAddr("10.0.0.1"), LocalAS: 65001}
+
+	plain, err := ChunkRoutes(false, attrs, routes, EncodingOptions{})
+	if err != nil {
+		t.Fatalf("ChunkRoutes (plain): %v", err)
+	}
+	chunks, err := ChunkRoutes(false, attrs, routes, opts)
+	if err != nil {
+		t.Fatalf("ChunkRoutes (add-path): %v", err)
+	}
+	if len(chunks) <= len(plain) {
+		t.Fatalf("add-path chunks = %d, want more than the %d plain chunks (4B/NLRI overhead)",
+			len(chunks), len(plain))
+	}
+	total := 0
+	for _, c := range chunks {
+		msg, err := BuildUpdateMessage(false, attrs, c, opts)
+		if err != nil {
+			t.Fatalf("BuildUpdateMessage: %v", err)
+		}
+		buf, err := SerializeMessage(msg, opts)
+		if err != nil {
+			t.Fatalf("SerializeMessage: %v", err)
+		}
+		if len(buf) > bgp.BGP_MAX_MESSAGE_LENGTH {
+			t.Fatalf("chunk serialized to %dB > %dB", len(buf), bgp.BGP_MAX_MESSAGE_LENGTH)
+		}
+		total += len(c)
+	}
+	if total != n {
+		t.Fatalf("chunked %d routes, want %d", total, n)
 	}
 }

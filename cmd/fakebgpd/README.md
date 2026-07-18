@@ -31,6 +31,7 @@ go build -o fakebgpd ./cmd/fakebgpd
 | `-router-id` | `10.0.0.2` | Router-ID (must be a dotted-quad). |
 | `-families` | `ipv4-unicast` | Comma-separated AFI/SAFI list, e.g. `ipv4-unicast,ipv6-unicast`. |
 | `-reflect` | `false` | Re-broadcast each received UPDATE to every other connected session. Required when both sender and receiver Peers connect to the same fakebgpd. |
+| `-addpath` | `false` | Advertise the RFC 7911 ADD-PATH capability (send/receive) for all families and decode Path Identifiers from clients that negotiated send. Reflection stays a raw byte re-send, so every connected Peer must use the same `addPath` capabilities (see `examples/ipv4_addpath.js`). |
 
 ## Example: minimal delivery smoke
 
@@ -51,7 +52,7 @@ round-trip through fakebgpd.
 - No Loc-RIB, no best-path, no policy. Reflection is a literal byte-for-
   byte re-send of the original UPDATE to every other session.
 - Capabilities advertised: MP-BGP (per `-families`), Route Refresh,
-  Extended Messages, 4-octet AS.
+  Extended Messages, 4-octet AS, and (with `-addpath`) ADD-PATH.
 - Hold time is hard-coded to 90 s, keepalive period to 30 s.
 - Intended for local smoke and CI; not for any kind of performance
   measurement of the BGP code path itself.

@@ -177,6 +177,13 @@ func parsePeerConfig(rt *sobek.Runtime, obj *sobek.Object) (peer.Config, map[str
 			}
 			cfg.Caps.GracefulRestart = gr
 		}
+		if vv := cobj.Get("addPath"); !common.IsNullish(vv) {
+			ap, err := parseAddPath(rt, vv)
+			if err != nil {
+				return cfg, nil, err
+			}
+			cfg.Caps.AddPath = ap
+		}
 	}
 
 	if v := obj.Get("tags"); !common.IsNullish(v) {
@@ -205,6 +212,37 @@ func parseGracefulRestart(rt *sobek.Runtime, v sobek.Value) (*packet.GRConfig, e
 		RestartTime:  uint16(optUint32(gobj, "restartTime")), // #nosec G115 -- Restart Time is a 12-bit value carried in a 16-bit field per RFC 4724 section 3
 		Notification: optBool(gobj, "notification"),
 	}, nil
+}
+
+// parseAddPath reads the RFC 7911 capability config from a JS object
+// mapping family name to direction:
+//
+//	capabilities: { addPath: { 'ipv4-unicast': 'both' } }
+//
+// Directions are 'receive', 'send', or 'both'. Every family listed
+// here must also appear in the Peer's `families`.
+func parseAddPath(rt *sobek.Runtime, v sobek.Value) (map[gobgp.Family]gobgp.BGPAddPathMode, error) {
+	obj := v.ToObject(rt)
+	if obj == nil {
+		return nil, errors.New("capabilities.addPath must be an object mapping family to direction")
+	}
+	keys := obj.Keys()
+	if len(keys) == 0 {
+		return nil, errors.New("capabilities.addPath must not be empty")
+	}
+	out := make(map[gobgp.Family]gobgp.BGPAddPathMode, len(keys))
+	for _, k := range keys {
+		f, err := packet.ResolveFamily(k)
+		if err != nil {
+			return nil, fmt.Errorf("capabilities.addPath: %w", err)
+		}
+		m, err := packet.ResolveAddPathMode(obj.Get(k).String())
+		if err != nil {
+			return nil, fmt.Errorf("capabilities.addPath[%s]: %w", k, err)
+		}
+		out[f] = m
+	}
+	return out, nil
 }
 
 // Open completes the OPEN/KEEPALIVE handshake and returns a JS object
@@ -365,11 +403,15 @@ func parsePrefixList(rt *sobek.Runtime, obj *sobek.Object) ([]string, error) {
 			return nil, fmt.Errorf("waitForPrefixes: prefixes[%d] is nullish", i)
 		}
 		if isStringValue(elem) {
-			pref, err := netip.ParsePrefix(elem.String())
+			base, idSuffix, err := splitPathID(elem.String())
 			if err != nil {
 				return nil, fmt.Errorf("waitForPrefixes: prefixes[%d]: %w", i, err)
 			}
-			out[i] = pref.String()
+			pref, err := netip.ParsePrefix(base)
+			if err != nil {
+				return nil, fmt.Errorf("waitForPrefixes: prefixes[%d]: %w", i, err)
+			}
+			out[i] = pref.String() + idSuffix
 			continue
 		}
 		eobj := elem.ToObject(rt)
@@ -380,9 +422,36 @@ func parsePrefixList(rt *sobek.Runtime, obj *sobek.Object) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("waitForPrefixes: prefixes[%d]: %w", i, err)
 		}
+		if v := eobj.Get("pathId"); !common.IsNullish(v) {
+			id := uint32(v.ToInteger()) // #nosec G115 -- Path Identifier is a 4-octet field per RFC 7911 section 3
+			key += ":" + strconv.FormatUint(uint64(id), 10)
+		}
 		out[i] = key
 	}
 	return out, nil
+}
+
+// splitPathID strips an optional RFC 7911 ":<path-id>" suffix off a
+// prefix string and returns the bare prefix plus the canonicalized
+// suffix (":<id>", or "" when absent). Only the ADD-PATH receive path
+// keys the observed-set this way. The prefix length always follows the
+// last '/', so a ':' after it can only start a path-id suffix — IPv6
+// colons all precede the '/'.
+func splitPathID(s string) (string, string, error) {
+	slash := strings.LastIndexByte(s, '/')
+	if slash < 0 {
+		return s, "", nil // not a prefix; ParsePrefix reports it
+	}
+	colon := strings.IndexByte(s[slash+1:], ':')
+	if colon < 0 {
+		return s, "", nil
+	}
+	idStr := s[slash+1+colon+1:]
+	id, err := strconv.ParseUint(idStr, 10, 32)
+	if err != nil {
+		return "", "", fmt.Errorf("path id %q: %w", idStr, err)
+	}
+	return s[:slash+1+colon], ":" + strconv.FormatUint(id, 10), nil
 }
 
 // descriptorKey routes a JS route-descriptor object to the per-family
@@ -638,56 +707,54 @@ func parseRoutesArray(rt *sobek.Runtime, family gobgp.Family, v sobek.Value) ([]
 // parseMUPRoute. For L3VPN families the element must be an object
 // carrying `{ rd, prefix }`; see parseVPNIPRoute.
 func parseRoute(rt *sobek.Runtime, family gobgp.Family, elem sobek.Value) (packet.Route, error) {
-	if family.Safi() == gobgp.SAFI_MUP {
-		if isStringValue(elem) {
+	if isStringValue(elem) {
+		switch {
+		case family.Safi() == gobgp.SAFI_MUP:
 			return nil, errors.New("mup route must be an object with a type field")
-		}
-		eobj := elem.ToObject(rt)
-		if eobj == nil {
-			return nil, errors.New("expected mup route object")
-		}
-		return parseMUPRoute(family, eobj)
-	}
-	if family.Safi() == gobgp.SAFI_MPLS_VPN {
-		if isStringValue(elem) {
+		case family.Safi() == gobgp.SAFI_MPLS_VPN:
 			return nil, errors.New("l3vpn route must be an object with rd and prefix")
-		}
-		eobj := elem.ToObject(rt)
-		if eobj == nil {
-			return nil, errors.New("expected l3vpn route object")
-		}
-		return parseVPNIPRoute(family, eobj)
-	}
-	if family == gobgp.RF_EVPN {
-		if isStringValue(elem) {
+		case family == gobgp.RF_EVPN:
 			return nil, errors.New("evpn route must be an object with a type field")
 		}
-		eobj := elem.ToObject(rt)
-		if eobj == nil {
-			return nil, errors.New("expected evpn route object")
-		}
-		return parseEVPNRoute(eobj)
-	}
-	if isStringValue(elem) {
 		pref, err := netip.ParsePrefix(elem.String())
 		if err != nil {
 			return nil, err
 		}
 		return newRouteForFamily(family, pref)
 	}
+
 	eobj := elem.ToObject(rt)
 	if eobj == nil {
 		return nil, errors.New("expected string or object")
 	}
-	pv := eobj.Get("prefix")
-	if common.IsNullish(pv) {
-		return nil, errors.New("missing prefix")
+	var r packet.Route
+	var err error
+	switch {
+	case family.Safi() == gobgp.SAFI_MUP:
+		r, err = parseMUPRoute(family, eobj)
+	case family.Safi() == gobgp.SAFI_MPLS_VPN:
+		r, err = parseVPNIPRoute(family, eobj)
+	case family == gobgp.RF_EVPN:
+		r, err = parseEVPNRoute(eobj)
+	default:
+		pv := eobj.Get("prefix")
+		if common.IsNullish(pv) {
+			return nil, errors.New("missing prefix")
+		}
+		var pref netip.Prefix
+		pref, err = netip.ParsePrefix(pv.String())
+		if err != nil {
+			return nil, err
+		}
+		r, err = newRouteForFamily(family, pref)
 	}
-	pref, err := netip.ParsePrefix(pv.String())
 	if err != nil {
 		return nil, err
 	}
-	return newRouteForFamily(family, pref)
+	if v := eobj.Get("pathId"); !common.IsNullish(v) {
+		return packet.WithPathID(r, uint32(v.ToInteger())), nil // #nosec G115 -- Path Identifier is a 4-octet field per RFC 7911 section 3
+	}
+	return r, nil
 }
 
 // newRouteForFamily picks the packet.Route constructor for the family.

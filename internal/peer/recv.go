@@ -66,7 +66,12 @@ func newObservedSet() *observedSet {
 	}
 }
 
-func (o *observedSet) applyUpdate(_ bgp.Family, ts timing.Timestamp, reach, unreach []bgp.PathNLRI) {
+// applyUpdate records reach/unreach NLRI. With ADD-PATH receive
+// negotiated for the family (addPath true) the key is
+// PathNLRI.String() — "<prefix>:<path-id>" — so the same prefix under
+// different Path Identifiers counts as distinct routes per RFC 7911
+// section 3; otherwise it stays the plain NLRI.String().
+func (o *observedSet) applyUpdate(_ bgp.Family, addPath bool, ts timing.Timestamp, reach, unreach []bgp.PathNLRI) {
 	o.mu.Lock()
 	o.updateSeq++
 	if o.firstUpdate.Time().IsZero() {
@@ -76,6 +81,9 @@ func (o *observedSet) applyUpdate(_ bgp.Family, ts timing.Timestamp, reach, unre
 
 	for i := range reach {
 		key := reach[i].NLRI.String()
+		if addPath {
+			key = reach[i].String()
+		}
 		fs, seen := o.firstSeen[key]
 		if !seen {
 			o.firstSeen[key] = ts
@@ -87,6 +95,9 @@ func (o *observedSet) applyUpdate(_ bgp.Family, ts timing.Timestamp, reach, unre
 	}
 	for i := range unreach {
 		key := unreach[i].NLRI.String()
+		if addPath {
+			key = unreach[i].String()
+		}
 		o.withdrawn[key] = struct{}{}
 		o.withdrawN++
 		o.notifyWithdraw(key)
@@ -294,12 +305,20 @@ func (f *fsm) dispatchUpdate(u *bgp.BGPUpdate, ts timing.Timestamp) {
 	for _, a := range u.PathAttributes {
 		switch v := a.(type) {
 		case *bgp.PathAttributeMpReachNLRI:
-			f.observed.applyUpdate(bgp.NewFamily(v.AFI, v.SAFI), ts, v.Value, nil)
+			fam := bgp.NewFamily(v.AFI, v.SAFI)
+			f.observed.applyUpdate(fam, f.addPathReceive(fam), ts, v.Value, nil)
 		case *bgp.PathAttributeMpUnreachNLRI:
-			f.observed.applyUpdate(bgp.NewFamily(v.AFI, v.SAFI), ts, nil, v.Value)
+			fam := bgp.NewFamily(v.AFI, v.SAFI)
+			f.observed.applyUpdate(fam, f.addPathReceive(fam), ts, nil, v.Value)
 		}
 	}
 	if len(u.NLRI) > 0 || len(u.WithdrawnRoutes) > 0 {
-		f.observed.applyUpdate(bgp.RF_IPv4_UC, ts, u.NLRI, u.WithdrawnRoutes)
+		f.observed.applyUpdate(bgp.RF_IPv4_UC, f.addPathReceive(bgp.RF_IPv4_UC), ts, u.NLRI, u.WithdrawnRoutes)
 	}
+}
+
+// addPathReceive reports whether ADD-PATH receive was negotiated for
+// fam, i.e. whether inbound NLRI for fam carry Path Identifiers.
+func (f *fsm) addPathReceive(fam bgp.Family) bool {
+	return f.addPathNegotiated[fam]&bgp.BGP_ADD_PATH_RECEIVE != 0
 }

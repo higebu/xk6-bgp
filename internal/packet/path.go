@@ -29,6 +29,20 @@ type Route interface {
 	WireLen() int
 }
 
+// PathIDRoute decorates any Route with an RFC 7911 Path Identifier.
+// The ID reaches the wire only when BuildUpdateMessage /
+// SerializeMessage run with EncodingOptions.AddPath enabling send for
+// the route's family; WireLen deliberately excludes the 4 ID octets —
+// ChunkRoutes accounts for them from the encoding options instead, so
+// the same Route packs correctly with and without ADD-PATH.
+type PathIDRoute struct {
+	Route
+	ID uint32
+}
+
+// WithPathID wraps r so it carries an RFC 7911 Path Identifier.
+func WithPathID(r Route, id uint32) PathIDRoute { return PathIDRoute{Route: r, ID: id} }
+
 type PathAttrs struct {
 	Origin    uint8 // 0 IGP, 1 EGP, 2 INCOMPLETE
 	NextHop   netip.Addr
@@ -149,6 +163,11 @@ type EncodingOptions struct {
 	// `Bad Message Length`. The Peer's `extendedMessage: true`
 	// capability defaults already advertise it.
 	UseExtendedMessages bool
+	// AddPath is the session's negotiated RFC 7911 mode per family.
+	// Set by the peer layer from the OPEN exchange, never from JS.
+	// When the send bit is set for the message family, every NLRI is
+	// prefixed with its 4-octet Path Identifier on the wire.
+	AddPath map[bgp.Family]bgp.BGPAddPathMode
 	// Use2ByteAS is set by the peer layer when the remote peer did not
 	// advertise the RFC 6793 4-octet AS capability. AS_PATH is then
 	// encoded with 2-octet AS numbers (AS_TRANS for non-mappable ones,
@@ -158,13 +177,13 @@ type EncodingOptions struct {
 }
 
 // marshallingOptions translates the session-negotiated fields into
-// gobgp MarshallingOptions. Returns nil in the default (4-octet AS)
-// case so the hot path stays allocation-free.
+// gobgp MarshallingOptions. Returns nil in the default (4-octet AS, no
+// ADD-PATH) case so the hot path stays allocation-free.
 func (o EncodingOptions) marshallingOptions() []*bgp.MarshallingOption {
-	if !o.Use2ByteAS {
+	if len(o.AddPath) == 0 && !o.Use2ByteAS {
 		return nil
 	}
-	return []*bgp.MarshallingOption{{Use2ByteAS: o.Use2ByteAS}}
+	return []*bgp.MarshallingOption{{AddPath: o.AddPath, Use2ByteAS: o.Use2ByteAS}}
 }
 
 // BGPExtendedMaxMessageLength is RFC 8654's relaxed max BGP message
@@ -188,7 +207,11 @@ func BuildUpdateMessage(withdraw bool, attrs PathAttrs, routes []Route, opts Enc
 			return nil, fmt.Errorf("routes[%d]: family %s does not match routes[0] family %s",
 				i, r.Family(), family)
 		}
-		nlris[i] = bgp.PathNLRI{NLRI: r.NLRI()}
+		nlri := bgp.PathNLRI{NLRI: r.NLRI()}
+		if pr, ok := r.(PathIDRoute); ok {
+			nlri.ID = pr.ID
+		}
+		nlris[i] = nlri
 	}
 
 	if family.Afi() == bgp.AFI_IP && family.Safi() == bgp.SAFI_UNICAST && !opts.UseMpReachForIPv4Unicast {
@@ -384,10 +407,17 @@ func ChunkRoutes(withdraw bool, attrs PathAttrs, routes []Route, opts EncodingOp
 			overhead, maxLen)
 	}
 
+	// With ADD-PATH send active for this family every NLRI carries a
+	// 4-octet Path Identifier that Route.WireLen() does not include.
+	perNLRI := 0
+	if bgp.IsAddPathEnabled(false, routes[0].Family(), opts.marshallingOptions()) {
+		perNLRI = 4
+	}
+
 	var chunks [][]Route
 	start, used := 0, 0
 	for i, r := range routes {
-		sz := r.WireLen()
+		sz := r.WireLen() + perNLRI
 		if sz > budget {
 			return nil, fmt.Errorf("routes[%d]: NLRI size %dB exceeds per-message budget %dB", i, sz, budget)
 		}

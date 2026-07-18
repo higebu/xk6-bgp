@@ -44,6 +44,102 @@ func TestAdvertise_RejectsExtendedWithoutNegotiation(t *testing.T) {
 	}
 }
 
+// TestAdvertise_RejectsPathIDWithoutNegotiation verifies a route
+// carrying an RFC 7911 Path Identifier is refused when ADD-PATH send
+// was not negotiated for the family.
+func TestAdvertise_RejectsPathIDWithoutNegotiation(t *testing.T) {
+	cfg := Config{
+		LocalAS:  65001,
+		Target:   "127.0.0.1:0",
+		RouterID: netip.MustParseAddr("10.0.0.1"),
+		Families: []bgp.Family{bgp.RF_IPv4_UC},
+	}
+	cfg.ApplyDefaults()
+	p := &Peer{cfg: cfg, fsm: newFSM(cfg)}
+	p.fsm.state.Store(int32(StateEstablished))
+	p.fsm.fourOctetASNegotiated = true
+
+	_, err := p.Advertise(AdvertiseRequest{
+		Family: bgp.RF_IPv4_UC,
+		Attrs:  packet.PathAttrs{NextHop: netip.MustParseAddr("10.0.0.1"), LocalAS: 65001},
+		Routes: []packet.Route{
+			packet.WithPathID(packet.MustIPRoute(bgp.RF_IPv4_UC, netip.MustParsePrefix("10.0.0.0/24")), 1),
+		},
+	})
+	if !errors.Is(err, ErrAddPathNotNegotiated) {
+		t.Fatalf("got err=%v, want ErrAddPathNotNegotiated", err)
+	}
+}
+
+// TestWriteUpdates_AddPath round-trips two paths for the same prefix
+// through writeUpdates on a session that negotiated ADD-PATH, reading
+// them back with the matching receive-side MarshallingOption.
+func TestWriteUpdates_AddPath(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	cfg := Config{
+		LocalAS:  65001,
+		Target:   "127.0.0.1:0",
+		RouterID: netip.MustParseAddr("10.0.0.1"),
+		Families: []bgp.Family{bgp.RF_IPv4_UC},
+	}
+	cfg.ApplyDefaults()
+
+	f := newFSM(cfg)
+	f.conn = c1
+	f.state.Store(int32(StateEstablished))
+	f.fourOctetASNegotiated = true
+	f.addPathNegotiated = map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_SEND}
+
+	routes := []packet.Route{
+		packet.WithPathID(packet.MustIPRoute(bgp.RF_IPv4_UC, netip.MustParsePrefix("10.0.0.0/24")), 1),
+		packet.WithPathID(packet.MustIPRoute(bgp.RF_IPv4_UC, netip.MustParsePrefix("10.0.0.0/24")), 2),
+	}
+
+	type recvNLRI struct {
+		prefix string
+		id     uint32
+	}
+	gotCh := make(chan []recvNLRI, 1)
+	go func() {
+		rxOpt := &bgp.MarshallingOption{
+			AddPath: map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_RECEIVE},
+		}
+		var got []recvNLRI
+		_, msg, err := ReadMessage(c2, rxOpt)
+		if err == nil {
+			if u, ok := msg.Body.(*bgp.BGPUpdate); ok {
+				for _, n := range u.NLRI {
+					got = append(got, recvNLRI{prefix: n.NLRI.String(), id: n.ID})
+				}
+			}
+		}
+		gotCh <- got
+	}()
+
+	attrs := packet.PathAttrs{NextHop: netip.MustParseAddr("10.0.0.1"), LocalAS: 65001}
+	if _, sent, err := f.writeUpdates(false, attrs, routes, packet.EncodingOptions{}, 0.0); err != nil || sent != 2 {
+		t.Fatalf("writeUpdates: sent=%d err=%v", sent, err)
+	}
+
+	select {
+	case got := <-gotCh:
+		want := []recvNLRI{{"10.0.0.0/24", 1}, {"10.0.0.0/24", 2}}
+		if len(got) != len(want) {
+			t.Fatalf("received %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("NLRI[%d] = %+v, want %+v", i, got[i], want[i])
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader did not finish in 2s")
+	}
+}
+
 // TestWriteUpdatesChunking verifies that announcing more routes than
 // fit in a single 4 KiB UPDATE results in multiple wire UPDATEs whose
 // decoded NLRIs reconstitute the original list, in order.

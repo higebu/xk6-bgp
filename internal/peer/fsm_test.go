@@ -476,6 +476,67 @@ func makePeerOpen(t *testing.T, caps ...bgp.ParameterCapabilityInterface) *bgp.B
 	return msg.Body.(*bgp.BGPOpen)
 }
 
+// TestAcceptPeerOpen_AddPathNegotiation exercises the RFC 7911
+// direction rules: each direction is enabled only when one side
+// advertised send and the other receive.
+func TestAcceptPeerOpen_AddPathNegotiation(t *testing.T) {
+	cases := []struct {
+		name  string
+		local bgp.BGPAddPathMode // 0 = ADD-PATH not configured locally
+		peer  bgp.BGPAddPathMode // 0 = peer sends no ADD-PATH capability
+		want  bgp.BGPAddPathMode
+	}{
+		{"both-both", bgp.BGP_ADD_PATH_BOTH, bgp.BGP_ADD_PATH_BOTH, bgp.BGP_ADD_PATH_BOTH},
+		{"send-receive", bgp.BGP_ADD_PATH_SEND, bgp.BGP_ADD_PATH_RECEIVE, bgp.BGP_ADD_PATH_SEND},
+		{"receive-send", bgp.BGP_ADD_PATH_RECEIVE, bgp.BGP_ADD_PATH_SEND, bgp.BGP_ADD_PATH_RECEIVE},
+		{"both-send", bgp.BGP_ADD_PATH_BOTH, bgp.BGP_ADD_PATH_SEND, bgp.BGP_ADD_PATH_RECEIVE},
+		{"send-send", bgp.BGP_ADD_PATH_SEND, bgp.BGP_ADD_PATH_SEND, 0},
+		{"receive-receive", bgp.BGP_ADD_PATH_RECEIVE, bgp.BGP_ADD_PATH_RECEIVE, 0},
+		{"local-none", 0, bgp.BGP_ADD_PATH_BOTH, 0},
+		{"peer-none", bgp.BGP_ADD_PATH_BOTH, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				LocalAS:  65001,
+				PeerAS:   65000,
+				RouterID: netip.MustParseAddr("10.0.0.1"),
+				Target:   "127.0.0.1:0",
+				Families: []bgp.Family{bgp.RF_IPv4_UC},
+			}
+			if tc.local != 0 {
+				cfg.Caps.AddPath = map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv4_UC: tc.local}
+			}
+			cfg.ApplyDefaults()
+			f := newFSM(cfg)
+
+			peerCaps := []bgp.ParameterCapabilityInterface{bgp.NewCapFourOctetASNumber(65000)}
+			if tc.peer != 0 {
+				peerCaps = append(peerCaps, bgp.NewCapAddPath([]*bgp.CapAddPathTuple{
+					bgp.NewCapAddPathTuple(bgp.RF_IPv4_UC, tc.peer),
+				}))
+			}
+			if err := f.acceptPeerOpen(makePeerOpen(t, peerCaps...)); err != nil {
+				t.Fatalf("acceptPeerOpen: %v", err)
+			}
+
+			if got := f.addPathNegotiated[bgp.RF_IPv4_UC]; got != tc.want {
+				t.Fatalf("negotiated mode = %v, want %v", got, tc.want)
+			}
+			if tc.want == 0 {
+				if f.addPathNegotiated != nil {
+					t.Fatalf("addPathNegotiated = %v, want nil", f.addPathNegotiated)
+				}
+				if f.msgOpts != nil {
+					t.Fatalf("msgOpts = %v, want nil on a 4-octet-AS non-ADD-PATH session", f.msgOpts)
+				}
+			} else if len(f.msgOpts) != 1 || f.msgOpts[0].AddPath[bgp.RF_IPv4_UC] != tc.want {
+				t.Fatalf("msgOpts = %v, want AddPath[%s]=%v", f.msgOpts, bgp.RF_IPv4_UC, tc.want)
+			}
+		})
+	}
+}
+
 // TestAcceptPeerOpen_TwoByteASPeer verifies a peer that does not
 // advertise the RFC 6793 4-octet AS capability flips the session to
 // 2-octet AS_PATH handling.
@@ -522,7 +583,7 @@ func TestAcceptPeerOpen_FourOctetASPeer(t *testing.T) {
 		t.Fatal("fourOctetASNegotiated = false for a peer with capability 65")
 	}
 	if f.msgOpts != nil {
-		t.Fatalf("msgOpts = %v, want nil on a 4-octet-AS session", f.msgOpts)
+		t.Fatalf("msgOpts = %v, want nil on a 4-octet-AS non-ADD-PATH session", f.msgOpts)
 	}
 }
 
