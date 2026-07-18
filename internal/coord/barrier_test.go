@@ -78,3 +78,29 @@ func TestRegistry_SameInstance(t *testing.T) {
 		t.Fatalf("Registry returned different Barrier pointers for the same name")
 	}
 }
+
+func TestBarrier_ArriveTimeout(t *testing.T) {
+	b, err := NewBarrier(2)
+	if err != nil {
+		t.Fatalf("NewBarrier: %v", err)
+	}
+	start := time.Now()
+	if _, err := b.ArriveTimeout(20 * time.Millisecond); err != ErrBarrierTimeout {
+		t.Fatalf("err=%v, want ErrBarrierTimeout", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("timeout not honored: %s", time.Since(start))
+	}
+	// The timed-out arrival still counts: a single further Arrive
+	// completes the rendezvous instead of wedging.
+	done := make(chan int64, 1)
+	go func() { done <- b.Arrive() }()
+	select {
+	case n := <-done:
+		if n != 2 {
+			t.Fatalf("second arrival index=%d, want 2", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("barrier did not release after timed-out arrival + one more Arrive")
+	}
+}

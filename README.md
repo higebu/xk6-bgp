@@ -194,6 +194,13 @@ the benchmark measures the steady-state throughput rather than ramp-up
 artifacts. Barriers are single-use — pick a fresh `name` per
 rendezvous if a script needs to barrier multiple times.
 
+`.arrive(timeout)` takes an optional timeout (k6 duration string or
+seconds number) and throws when it elapses. Always pass one in scripts
+where a VU can fail before its `arrive()` (a failed `open()`,
+typically) — without a timeout the remaining VUs block until the
+scenario's `maxDuration`. A timed-out arrival still counts toward
+`count`, so one aborted VU does not wedge the rest a second time.
+
 ## Supported AFI/SAFI
 
 | Family string | SAFI | Route descriptor | Reference | Doc | Example |

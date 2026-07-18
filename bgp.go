@@ -1230,7 +1230,10 @@ func optBool(obj *sobek.Object, key string) bool {
 // types.ParseExtendedDuration so "12d" etc. work), a seconds-number, or
 // nullish (returns 0).
 func optDuration(obj *sobek.Object, key string) (time.Duration, error) {
-	v := obj.Get(key)
+	return valueDuration(obj.Get(key))
+}
+
+func valueDuration(v sobek.Value) (time.Duration, error) {
 	if common.IsNullish(v) {
 		return 0, nil
 	}

@@ -10,7 +10,12 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// ErrBarrierTimeout is returned by ArriveTimeout when the rendezvous
+// does not complete within the given duration.
+var ErrBarrierTimeout = errors.New("barrier: timed out waiting for participants")
 
 // Barrier blocks every caller of Arrive() until Target callers have
 // arrived, then releases all of them. Subsequent Arrive() calls
@@ -37,12 +42,31 @@ func NewBarrier(target int) (*Barrier, error) {
 // rendezvous so callers can detect who "tripped" the barrier (the
 // caller whose index equals Target is the one that completed it).
 func (b *Barrier) Arrive() int64 {
+	n, _ := b.ArriveTimeout(0)
+	return n
+}
+
+// ArriveTimeout is Arrive with an upper bound on the wait; d <= 0
+// waits forever. On timeout the arrival is NOT withdrawn — the caller
+// still counts toward Target, so a VU that gives up and aborts does
+// not additionally wedge the VUs still waiting.
+func (b *Barrier) ArriveTimeout(d time.Duration) (int64, error) {
 	n := b.arrived.Add(1)
 	if n == b.target {
 		close(b.done)
 	}
-	<-b.done
-	return n
+	if d <= 0 {
+		<-b.done
+		return n, nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-b.done:
+		return n, nil
+	case <-timer.C:
+		return n, ErrBarrierTimeout
+	}
 }
 
 // Registry stores Barriers by name. Multiple VUs requesting the same
