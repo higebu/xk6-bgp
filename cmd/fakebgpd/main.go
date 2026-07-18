@@ -196,7 +196,7 @@ func handleConn(conn net.Conn, h *hub, myAS uint32, rid string, families []bgp.F
 }
 
 func describeUpdate(remote net.Addr, n int, u *bgp.BGPUpdate) {
-	advertised, withdrawn := 0, 0
+	advertised, withdrawn := len(u.NLRI), len(u.WithdrawnRoutes)
 	for _, a := range u.PathAttributes {
 		switch v := a.(type) {
 		case *bgp.PathAttributeMpReachNLRI:
