@@ -535,7 +535,11 @@ func (p *Peer) parseAdvertiseArg(rt *sobek.Runtime, arg sobek.Value, withdraw bo
 		}
 		attrs.NextHop = addr
 		attrs.LocalAS = optUint32(obj, "localAs")
-		attrs.Origin = uint8(optUint32(obj, "origin")) // #nosec G115 -- ORIGIN is one of {0,1,2} per RFC 4271 section 5.1.1
+		origin := optUint32(obj, "origin")
+		if origin > 2 {
+			return peer.AdvertiseRequest{}, fmt.Errorf("origin: must be 0 (IGP), 1 (EGP), or 2 (INCOMPLETE) per RFC 4271 section 5.1.1, got %d", origin)
+		}
+		attrs.Origin = uint8(origin) // #nosec G115 -- range checked above
 		if v := obj.Get("med"); !common.IsNullish(v) {
 			m := uint32(v.ToInteger()) // #nosec G115 -- MULTI_EXIT_DISC is a 4-octet field per RFC 4271 section 5.1.4
 			attrs.MED = &m
