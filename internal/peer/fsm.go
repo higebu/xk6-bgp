@@ -51,6 +51,22 @@ var (
 	ErrSessionNotReady = errors.New("xk6-bgp: peer is not in Established state")
 )
 
+// notificationWriteTimeout bounds the best-effort NOTIFICATION write on
+// teardown paths. Without it a peer that stopped reading would leave
+// Close (or the hold-timer failure path) blocked in conn.Write behind
+// writeMu indefinitely.
+const notificationWriteTimeout = 2 * time.Second
+
+// openRejectError carries the RFC 4271 section 6.2 subcode to put in
+// the OPEN Message Error NOTIFICATION when the peer's OPEN is
+// unacceptable.
+type openRejectError struct {
+	subcode uint8
+	reason  string
+}
+
+func (e *openRejectError) Error() string { return e.reason }
+
 type fsm struct {
 	cfg Config
 
@@ -192,7 +208,12 @@ func (f *fsm) handshake(parent context.Context, deadline time.Time) error {
 				return fmt.Errorf("%w: duplicate OPEN", ErrUnexpectedMsg)
 			}
 			if err := f.acceptPeerOpen(m); err != nil {
-				_ = f.sendNotification(bgp.BGP_ERROR_OPEN_MESSAGE_ERROR, bgp.BGP_ERROR_SUB_UNACCEPTABLE_HOLD_TIME, nil)
+				subcode := uint8(0) // 0 = unspecific per RFC 4271 section 6
+				var oe *openRejectError
+				if errors.As(err, &oe) {
+					subcode = oe.subcode
+				}
+				_ = f.sendNotification(bgp.BGP_ERROR_OPEN_MESSAGE_ERROR, subcode, nil)
 				return err
 			}
 			if err := f.writeMessage(BuildKeepalive()); err != nil {
@@ -229,7 +250,10 @@ func (f *fsm) handshake(parent context.Context, deadline time.Time) error {
 
 func (f *fsm) acceptPeerOpen(m *bgp.BGPOpen) error {
 	if m.HoldTime != 0 && m.HoldTime < 3 {
-		return fmt.Errorf("xk6-bgp: peer advertised invalid HoldTime %ds", m.HoldTime)
+		return &openRejectError{
+			subcode: bgp.BGP_ERROR_SUB_UNACCEPTABLE_HOLD_TIME,
+			reason:  fmt.Sprintf("xk6-bgp: peer advertised invalid HoldTime %ds", m.HoldTime),
+		}
 	}
 
 	// RFC 4271 section 4.2: HoldTime is min(local, peer); 0 disables keepalive.
@@ -263,7 +287,10 @@ func (f *fsm) acceptPeerOpen(m *bgp.BGPOpen) error {
 	}
 
 	if f.cfg.PeerAS != 0 && f.peerAS != f.cfg.PeerAS {
-		return fmt.Errorf("xk6-bgp: peer AS mismatch: config=%d wire=%d", f.cfg.PeerAS, f.peerAS)
+		return &openRejectError{
+			subcode: bgp.BGP_ERROR_SUB_BAD_PEER_AS,
+			reason:  fmt.Sprintf("xk6-bgp: peer AS mismatch: config=%d wire=%d", f.cfg.PeerAS, f.peerAS),
+		}
 	}
 	return nil
 }
@@ -325,6 +352,15 @@ func (f *fsm) readLoop() {
 			if f.loopCtx.Err() != nil {
 				return
 			}
+			// RFC 4271 section 6.5: hold timer expiry must be announced
+			// with a NOTIFICATION (code 4) before dropping the session.
+			var nerr net.Error
+			if errors.As(err, &nerr) && nerr.Timeout() && f.negotiatedHold > 0 {
+				_ = f.conn.SetWriteDeadline(time.Now().Add(notificationWriteTimeout))
+				_ = f.sendNotification(bgp.BGP_ERROR_HOLD_TIMER_EXPIRED, 0, nil)
+				f.fail(fmt.Errorf("xk6-bgp: hold timer expired: %w", err))
+				return
+			}
 			f.fail(fmt.Errorf("xk6-bgp: read: %w", err))
 			return
 		}
@@ -351,6 +387,12 @@ func (f *fsm) Close() error {
 		return nil
 	}
 
+	if f.conn != nil {
+		// Unblock a writer stuck in conn.Write while holding writeMu
+		// (its Write returns a timeout error) and bound the Cease write
+		// below, so Close cannot hang on a peer that stopped reading.
+		_ = f.conn.SetWriteDeadline(time.Now().Add(notificationWriteTimeout))
+	}
 	if f.conn != nil && prev == StateEstablished {
 		_ = f.sendNotification(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_ADMINISTRATIVE_SHUTDOWN, nil)
 	}

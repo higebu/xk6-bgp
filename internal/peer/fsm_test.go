@@ -399,3 +399,67 @@ func TestFSM_AdvertiseBeforeEstablishedRejected(t *testing.T) {
 		t.Fatalf("expected ErrSessionNotReady, got %v", err)
 	}
 }
+
+// TestFSM_BadPeerASNotificationSubcode verifies the OPEN rejection for
+// an AS mismatch carries subcode 2 (Bad Peer AS) per RFC 4271 section
+// 6.2, not a generic or unrelated subcode.
+func TestFSM_BadPeerASNotificationSubcode(t *testing.T) {
+	l, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer l.Close()
+
+	notifCh := make(chan *bgp.BGPNotification, 1)
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, _, err := ReadMessage(conn); err != nil { // FSM's OPEN
+			return
+		}
+		// Advertise AS 65999 while the test Peer expects 65000.
+		open, err := BuildOpen(65999, 180*time.Second, netip.MustParseAddr("10.0.0.2"), packet.CapsConfig{
+			Families:    []bgp.Family{bgp.RF_IPv4_UC},
+			FourOctetAS: 65999,
+		})
+		if err != nil {
+			return
+		}
+		obuf, _ := open.Serialize()
+		if _, err := conn.Write(obuf); err != nil {
+			return
+		}
+		kbuf, _ := BuildKeepalive().Serialize()
+		if _, err := conn.Write(kbuf); err != nil {
+			return
+		}
+		for {
+			_, msg, err := ReadMessage(conn)
+			if err != nil {
+				return
+			}
+			if n, ok := msg.Body.(*bgp.BGPNotification); ok {
+				notifCh <- n
+				return
+			}
+		}
+	}()
+
+	p := newTestPeer(t, l.Addr().String())
+	if err := p.Open(context.Background()); err == nil {
+		t.Fatal("expected AS-mismatch error from Open")
+	}
+	select {
+	case n := <-notifCh:
+		if n.ErrorCode != bgp.BGP_ERROR_OPEN_MESSAGE_ERROR || n.ErrorSubcode != bgp.BGP_ERROR_SUB_BAD_PEER_AS {
+			t.Fatalf("NOTIFICATION code=%d sub=%d, want code=%d sub=%d",
+				n.ErrorCode, n.ErrorSubcode, bgp.BGP_ERROR_OPEN_MESSAGE_ERROR, bgp.BGP_ERROR_SUB_BAD_PEER_AS)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("peer never received a NOTIFICATION")
+	}
+}
