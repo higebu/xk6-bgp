@@ -1,15 +1,17 @@
 package peer
 
 import (
+	"errors"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	bgp "github.com/osrg/gobgp/v4/pkg/packet/bgp"
 
-	"github.com/higebu/xk6-bgp/internal/timing"
 	"github.com/higebu/xk6-bgp/internal/packet"
+	"github.com/higebu/xk6-bgp/internal/timing"
 )
 
 func mustPathNLRIs(t *testing.T, prefixes ...string) []bgp.PathNLRI {
@@ -229,3 +231,32 @@ func TestWaitForPrefixes_OnlyAfter(t *testing.T) {
 		t.Fatalf("expected timeout, got nil err, res=%+v", res)
 	}
 }
+
+// TestWaitForPrefixes_SessionFailureWakesWaiter verifies a session-
+// fatal error releases a blocked waiter immediately instead of letting
+// it run out the full timeout.
+func TestWaitForPrefixes_SessionFailureWakesWaiter(t *testing.T) {
+	o := newObservedSet()
+	cfg := Config{LocalAS: 65001, Target: "127.0.0.1:0", RouterID: netip.MustParseAddr("10.0.0.1"), Families: []bgp.Family{bgp.RF_IPv4_UC}}
+	cfg.ApplyDefaults()
+	p := &Peer{cfg: cfg, fsm: &fsm{observed: o}}
+	p.fsm.state.Store(int32(StateEstablished))
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		o.fail(errors.New("peer sent NOTIFICATION"))
+	}()
+
+	start := time.Now()
+	_, err := p.WaitForPrefixes([]string{"10.10.0.0/24"}, 5*time.Second, timing.Timestamp{})
+	if err == nil {
+		t.Fatal("expected session-down error")
+	}
+	if !strings.Contains(err.Error(), "session down") {
+		t.Fatalf("err=%v, want session-down error", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waiter released after %s, want immediate wake", elapsed)
+	}
+}
+

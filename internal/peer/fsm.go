@@ -418,6 +418,10 @@ func (f *fsm) fail(err error) {
 		_ = f.conn.Close()
 	}
 	f.state.Store(int32(StateIdle))
+	// Wake blocked WaitForPrefixes callers immediately — no further
+	// UPDATEs can arrive, so letting them run out their timeout would
+	// just stall the VU.
+	f.observed.fail(err)
 	select {
 	case f.doneCh <- err:
 	default:

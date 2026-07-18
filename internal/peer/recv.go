@@ -21,6 +21,11 @@ import (
 type observedSet struct {
 	mu sync.Mutex
 
+	// failedErr is set once when the session dies (NOTIFICATION, hold
+	// timer expiry, read error). It releases current and future waiters
+	// immediately instead of letting them run out their timeout.
+	failedErr error
+
 	firstSeen map[string]timing.Timestamp
 	withdrawn map[string]struct{}
 
@@ -159,13 +164,27 @@ func (o *observedSet) registerWaiter(want []string, onlyAfter timing.Timestamp) 
 		}
 		w.pending[p] = struct{}{}
 	}
-	if len(w.pending) == 0 {
+	if len(w.pending) == 0 || o.failedErr != nil {
 		w.markDone()
 	} else {
 		o.waiters = append(o.waiters, w)
 	}
 	o.mu.Unlock()
 	return w
+}
+
+// fail records the session-fatal error and releases every blocked
+// waiter. Called from fsm.fail; waiters report their unmatched
+// prefixes as missing together with the session error.
+func (o *observedSet) fail(err error) {
+	o.mu.Lock()
+	if o.failedErr == nil {
+		o.failedErr = err
+	}
+	for _, w := range o.waiters {
+		w.markDone()
+	}
+	o.mu.Unlock()
 }
 
 func (o *observedSet) deregisterWaiter(w *waiter) {
@@ -208,9 +227,11 @@ func (p *Peer) WaitForPrefixes(want []string, timeout time.Duration, onlyAfter t
 	w := o.registerWaiter(want, onlyAfter)
 	defer o.deregisterWaiter(w)
 
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case <-w.done:
-	case <-time.After(timeout):
+	case <-timer.C:
 	}
 
 	o.mu.Lock()
@@ -224,9 +245,14 @@ func (p *Peer) WaitForPrefixes(want []string, timeout time.Duration, onlyAfter t
 		FirstSeen: w.first,
 		LastSeen:  w.last,
 	}
+	failed := o.failedErr
 	o.mu.Unlock()
 
 	if len(missing) > 0 {
+		if failed != nil {
+			return res, fmt.Errorf("waitForPrefixes: session down (%w), missing %d/%d",
+				failed, len(missing), len(want))
+		}
 		return res, fmt.Errorf("waitForPrefixes: timed out after %s, missing %d/%d",
 			timeout, len(missing), len(want))
 	}
