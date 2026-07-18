@@ -134,7 +134,7 @@ func TestReadMessageMax_AllowsExtendedWhenBudgetIsExtended(t *testing.T) {
 	hdr[18] = byte(bgp.BGP_MSG_UPDATE)
 	stream := bytes.NewReader(hdr[:])
 
-	_, _, err := ReadMessageMax(stream, packet.BGPExtendedMaxMessageLength)
+	_, _, _, err := ReadMessageMax(stream, packet.BGPExtendedMaxMessageLength)
 	if err == nil {
 		t.Fatal("expected EOF-style error while reading body, got nil")
 	}

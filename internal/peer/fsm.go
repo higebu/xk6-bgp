@@ -320,7 +320,7 @@ func (f *fsm) readLoop() {
 		if f.extendedMessagesNegotiated {
 			maxLen = packet.BGPExtendedMaxMessageLength
 		}
-		_, msg, err := ReadMessageMax(f.conn, maxLen)
+		_, msg, ts, err := ReadMessageMax(f.conn, maxLen)
 		if err != nil {
 			if f.loopCtx.Err() != nil {
 				return
@@ -328,7 +328,6 @@ func (f *fsm) readLoop() {
 			f.fail(fmt.Errorf("xk6-bgp: read: %w", err))
 			return
 		}
-		ts := timing.Now()
 
 		switch m := msg.Body.(type) {
 		case *bgp.BGPUpdate:

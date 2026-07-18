@@ -11,6 +11,7 @@ import (
 	bgp "github.com/osrg/gobgp/v4/pkg/packet/bgp"
 
 	"github.com/higebu/xk6-bgp/internal/packet"
+	"github.com/higebu/xk6-bgp/internal/timing"
 )
 
 // BuildOpen constructs an OPEN message ready to serialize. routerID must
@@ -57,7 +58,8 @@ func BuildNotification(code, subcode uint8, data []byte) *bgp.BGPMessage {
 // RFC 8654 Extended Messages use ReadMessageMax with the higher cap.
 // Callers that just want to re-emit can skip Serialize.
 func ReadMessage(r io.Reader) ([]byte, *bgp.BGPMessage, error) {
-	return ReadMessageMax(r, bgp.BGP_MAX_MESSAGE_LENGTH)
+	raw, msg, _, err := ReadMessageMax(r, bgp.BGP_MAX_MESSAGE_LENGTH)
+	return raw, msg, err
 }
 
 // ReadMessageMax is the variant of ReadMessage that bounds the
@@ -65,35 +67,39 @@ func ReadMessage(r io.Reader) ([]byte, *bgp.BGPMessage, error) {
 // packet.BGPExtendedMaxMessageLength only after the RFC 8654 capability
 // has been negotiated by both sides; otherwise a buggy or hostile peer
 // could force the allocation of a 64 KiB read buffer per message.
-func ReadMessageMax(r io.Reader, maxLen int) ([]byte, *bgp.BGPMessage, error) {
+// The returned Timestamp is captured right after the last byte of the
+// message is read, before ParseBGPMessage — for a large UPDATE the
+// parse cost must not leak into bgp_prefix_received_duration.
+func ReadMessageMax(r io.Reader, maxLen int) ([]byte, *bgp.BGPMessage, timing.Timestamp, error) {
 	var hdr [bgp.BGP_HEADER_LENGTH]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, nil, err
+		return nil, nil, timing.Timestamp{}, err
 	}
 	for i := range 16 {
 		if hdr[i] != 0xff {
-			return nil, nil, errors.New("BGP header marker is not all-ones")
+			return nil, nil, timing.Timestamp{}, errors.New("BGP header marker is not all-ones")
 		}
 	}
 	mlen := int(binary.BigEndian.Uint16(hdr[16:18]))
 	if mlen < bgp.BGP_HEADER_LENGTH {
-		return nil, nil, fmt.Errorf("BGP message length %d too small", mlen)
+		return nil, nil, timing.Timestamp{}, fmt.Errorf("BGP message length %d too small", mlen)
 	}
 	if mlen > maxLen {
-		return nil, nil, fmt.Errorf("BGP message length %d exceeds max %d", mlen, maxLen)
+		return nil, nil, timing.Timestamp{}, fmt.Errorf("BGP message length %d exceeds max %d", mlen, maxLen)
 	}
 	full := make([]byte, mlen)
 	copy(full[:bgp.BGP_HEADER_LENGTH], hdr[:])
 	if mlen > bgp.BGP_HEADER_LENGTH {
 		if _, err := io.ReadFull(r, full[bgp.BGP_HEADER_LENGTH:]); err != nil {
-			return nil, nil, err
+			return nil, nil, timing.Timestamp{}, err
 		}
 	}
+	ts := timing.Now()
 	msg, err := bgp.ParseBGPMessage(full)
 	if err != nil {
-		return full, nil, err
+		return full, nil, ts, err
 	}
-	return full, msg, nil
+	return full, msg, ts, nil
 }
 
 // WriteMessage serializes msg and writes it as a single Write. The
