@@ -39,6 +39,12 @@ const NUM_PEERS = parseInt(__ENV.NUM_PEERS || '100', 10);
 // Configure matching loopback aliases on the k6 host beforehand.
 const LOCAL_PREFIX = __ENV.LOCAL_PREFIX || '';
 
+// Upper bound on every barrier wait. Must exceed openTimeout, or slow
+// (but successful) opens get cut off. Without it a single VU whose
+// open() failed would leave every other VU blocked in arrive() until
+// the scenario's maxDuration.
+const BARRIER_TIMEOUT = __ENV.BARRIER_TIMEOUT || '6m';
+
 export const options = {
   scenarios: {
     open: {
@@ -91,16 +97,24 @@ export default function () {
   // start by a few ms, letting early VUs reach Established before
   // later ones even dial — the resulting bgp_session_up
   // distribution would underestimate the open-burst load.
-  bgp.barrier('pre-open', NUM_PEERS).arrive();
+  bgp.barrier('pre-open', NUM_PEERS).arrive(BARRIER_TIMEOUT);
 
-  const opened = peer.open();
+  let opened;
+  try {
+    opened = peer.open();
+  } catch (e) {
+    // Still arrive: a timed-out or failed open must not leave the
+    // other VUs waiting on this VU's arrival.
+    bgp.barrier('all-established', NUM_PEERS).arrive(BARRIER_TIMEOUT);
+    throw e;
+  }
   console.log(`vu=${vu} session_up_us=${opened.sessionUpUs}`); // µs from OpenSent to Established
 
   // Hold every session up until the last VU has finished open();
   // otherwise early-finishing VUs would FIN their TCP sockets while
   // the DUT is still processing late OPENs, perturbing both sides'
   // measurements.
-  bgp.barrier('all-established', NUM_PEERS).arrive();
+  bgp.barrier('all-established', NUM_PEERS).arrive(BARRIER_TIMEOUT);
 
   peer.close();
 

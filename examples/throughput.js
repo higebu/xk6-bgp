@@ -145,28 +145,33 @@ export default function () {
   receiver.open();
   sender.open();
 
-  const routes = buildRoutes(COUNT);
-  const adv = sender.advertise({
-    family:              FAMILY,
-    nextHop:             SENDER_NEXTHOP,
-    localAs:             SENDER_AS,
-    routes:              routes,
-    useMpReach:          USE_MP_REACH,
-    useExtendedMessages: EXTENDED_MESSAGES,
-    updateRate:          UPDATE_RATE,
-  });
+  try {
+    const routes = buildRoutes(COUNT);
+    const adv = sender.advertise({
+      family:              FAMILY,
+      nextHop:             SENDER_NEXTHOP,
+      localAs:             SENDER_AS,
+      routes:              routes,
+      useMpReach:          USE_MP_REACH,
+      useExtendedMessages: EXTENDED_MESSAGES,
+      updateRate:          UPDATE_RATE,
+    });
 
-  const res = receiver.waitForPrefixes({
-    prefixes:     routes,
-    timeout:      TIMEOUT,
-    sentAtMonoNs: adv.sentAtMonoNs,
-  });
-  const us = Math.round((res.lastSeenMonoNs - adv.sentAtMonoNs) / 1000);
-  const ratePerS = us > 0 ? Math.round((res.matched * 1e6) / us) : 0;
-  console.log(`iter sent=${adv.count} matched=${res.matched} duration_us=${us} rate=${ratePerS} routes/s`);
-
-  receiver.close();
-  sender.close();
+    const res = receiver.waitForPrefixes({
+      prefixes:     routes,
+      timeout:      TIMEOUT,
+      sentAtMonoNs: adv.sentAtMonoNs,
+    });
+    const us = Math.round((res.lastSeenMonoNs - adv.sentAtMonoNs) / 1000);
+    const ratePerS = us > 0 ? Math.round((res.matched * 1e6) / us) : 0;
+    console.log(`iter sent=${adv.count} matched=${res.matched} duration_us=${us} rate=${ratePerS} routes/s`);
+  } finally {
+    // Close in a finally so a waitForPrefixes timeout does not leak
+    // the sessions; the bgp_prefix_received threshold still fails the
+    // run on missing prefixes.
+    receiver.close();
+    sender.close();
+  }
 
   // Give the DUT time to fully tear down the previous TCP session
   // before the next iteration opens new peers from the same source IP;

@@ -85,11 +85,20 @@ export default function () {
   });
   console.log(`advertised ${adv.count} routes`);
 
-  const res = receiver.waitForPrefixes({
-    prefixes:     routes,
-    timeout:      TIMEOUT,
-    sentAtMonoNs: adv.sentAtMonoNs,
-  });
+  let res;
+  try {
+    res = receiver.waitForPrefixes({
+      prefixes:     routes,
+      timeout:      TIMEOUT,
+      sentAtMonoNs: adv.sentAtMonoNs,
+    });
+  } catch (e) {
+    console.error(`waitForPrefixes error: ${e}`);
+    receiver.close();
+    sender.close();
+    return;
+  }
+
   const us = Math.round((res.lastSeenMonoNs - adv.sentAtMonoNs) / 1000);
   console.log(`received: matched=${res.matched} duration_us=${us}`);
 

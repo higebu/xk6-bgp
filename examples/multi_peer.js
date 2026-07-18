@@ -63,6 +63,12 @@ const EXTENDED_MESSAGES  = (__ENV.EXTENDED_MESSAGES || '') === '1';
 // measurement.
 const WAIT_ALL_ESTABLISHED = (__ENV.WAIT_ALL_ESTABLISHED || '1') === '1';
 
+// Upper bound on the all-established barrier wait. Must exceed
+// openTimeout, or slow (but successful) opens get cut off. Without it
+// a single VU whose open() failed would leave every other VU blocked
+// in arrive() until the scenario's maxDuration.
+const BARRIER_TIMEOUT = __ENV.BARRIER_TIMEOUT || '6m';
+
 const SENDER_NEXTHOP_V4 = __ENV.SENDER_NEXTHOP_V4 || '10.99.0.99';
 const SENDER_NEXTHOP_V6 = __ENV.SENDER_NEXTHOP_V6 || '2001:db8::99';
 
@@ -147,35 +153,50 @@ export default function () {
   const receiver = mkPeer('vu-' + vu + '-receiver',
     RECEIVER_AS, receiverRid, TARGET_RECEIVER, PEER_AS_RECEIVER, receiverLocal);
 
-  receiver.open();
-  sender.open();
-
-  if (WAIT_ALL_ESTABLISHED) {
-    bgp.barrier('all-established', NUM_PEERS).arrive();
+  try {
+    receiver.open();
+    sender.open();
+  } catch (e) {
+    // Still arrive: a failed open must not leave the other VUs
+    // waiting on this VU's arrival.
+    if (WAIT_ALL_ESTABLISHED) {
+      bgp.barrier('all-established', NUM_PEERS).arrive(BARRIER_TIMEOUT);
+    }
+    receiver.close();
+    sender.close();
+    throw e;
   }
 
-  const routes = buildRoutes(vu, COUNT_PER_PEER);
-  const adv = sender.advertise({
-    family:              FAMILY,
-    nextHop:             FAMILY === 'ipv6-unicast' ? SENDER_NEXTHOP_V6 : SENDER_NEXTHOP_V4,
-    localAs:             SENDER_AS,
-    routes:              routes,
-    useMpReach:          USE_MP_REACH,
-    useExtendedMessages: EXTENDED_MESSAGES,
-    updateRate:          UPDATE_RATE,
-  });
+  if (WAIT_ALL_ESTABLISHED) {
+    bgp.barrier('all-established', NUM_PEERS).arrive(BARRIER_TIMEOUT);
+  }
 
-  const res = receiver.waitForPrefixes({
-    prefixes:     routes,
-    timeout:      TIMEOUT,
-    sentAtMonoNs: adv.sentAtMonoNs,
-  });
-  const us = Math.round((res.lastSeenMonoNs - adv.sentAtMonoNs) / 1000);
-  const ratePerS = us > 0 ? Math.round((res.matched * 1e6) / us) : 0;
-  console.log(`vu=${vu} sent=${adv.count} matched=${res.matched} duration_us=${us} rate=${ratePerS} routes/s`);
+  try {
+    const routes = buildRoutes(vu, COUNT_PER_PEER);
+    const adv = sender.advertise({
+      family:              FAMILY,
+      nextHop:             FAMILY === 'ipv6-unicast' ? SENDER_NEXTHOP_V6 : SENDER_NEXTHOP_V4,
+      localAs:             SENDER_AS,
+      routes:              routes,
+      useMpReach:          USE_MP_REACH,
+      useExtendedMessages: EXTENDED_MESSAGES,
+      updateRate:          UPDATE_RATE,
+    });
 
-  receiver.close();
-  sender.close();
+    const res = receiver.waitForPrefixes({
+      prefixes:     routes,
+      timeout:      TIMEOUT,
+      sentAtMonoNs: adv.sentAtMonoNs,
+    });
+    const us = Math.round((res.lastSeenMonoNs - adv.sentAtMonoNs) / 1000);
+    const ratePerS = us > 0 ? Math.round((res.matched * 1e6) / us) : 0;
+    console.log(`vu=${vu} sent=${adv.count} matched=${res.matched} duration_us=${us} rate=${ratePerS} routes/s`);
+  } finally {
+    // Close in a finally so a waitForPrefixes timeout does not leak
+    // the sessions until maxDuration.
+    receiver.close();
+    sender.close();
+  }
 
   sleep(parseFloat(__ENV.ITER_SLEEP || '0'));
 }
