@@ -260,3 +260,133 @@ func TestWaitForPrefixes_SessionFailureWakesWaiter(t *testing.T) {
 	}
 }
 
+// dispatchRaw feeds a hand-crafted wire-format UPDATE through the same
+// parse + dispatch path readLoop uses and returns the observed set.
+func dispatchRaw(t *testing.T, raw []byte) *observedSet {
+	t.Helper()
+	msg, err := bgp.ParseBGPMessage(raw)
+	if err != nil {
+		t.Fatalf("ParseBGPMessage: %v", err)
+	}
+	upd, ok := msg.Body.(*bgp.BGPUpdate)
+	if !ok {
+		t.Fatalf("parsed %T, want *bgp.BGPUpdate", msg.Body)
+	}
+	f := &fsm{observed: newObservedSet()}
+	f.dispatchUpdate(upd, timing.Now())
+	return f.observed
+}
+
+func marker() []byte {
+	m := make([]byte, 16)
+	for i := range m {
+		m[i] = 0xff
+	}
+	return m
+}
+
+// TestDispatch_KnownBytes_IPv4Unicast decodes a byte-literal RFC 4271
+// UPDATE (ORIGIN IGP, AS_PATH SEQ{65001}, NEXT_HOP 10.0.0.1, NLRI
+// 10.1.0.0/24 + 10.2.0.0/16) so a symmetric encode/decode bug in our
+// own builder cannot mask a receive-path regression.
+func TestDispatch_KnownBytes_IPv4Unicast(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x32, // length 50
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x14, // total path attribute length 20
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 4-octet AS
+		0x40, 0x03, 0x04, 0x0a, 0x00, 0x00, 0x01, // NEXT_HOP 10.0.0.1
+		0x18, 0x0a, 0x01, 0x00, // 10.1.0.0/24
+		0x10, 0x0a, 0x02, // 10.2.0.0/16
+	)
+	o := dispatchRaw(t, raw)
+	for _, want := range []string{"10.1.0.0/24", "10.2.0.0/16"} {
+		if _, ok := o.firstSeen[want]; !ok {
+			t.Errorf("prefix %s not observed; got %v", want, mapKeys(o.firstSeen))
+		}
+	}
+	if len(o.firstSeen) != 2 {
+		t.Errorf("observed %d prefixes, want 2: %v", len(o.firstSeen), mapKeys(o.firstSeen))
+	}
+}
+
+// TestDispatch_KnownBytes_IPv4Withdraw decodes a byte-literal UPDATE
+// whose only content is the Withdrawn Routes field.
+func TestDispatch_KnownBytes_IPv4Withdraw(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x1b, // length 27
+		0x02,       // type UPDATE
+		0x00, 0x04, // withdrawn routes length 4
+		0x18, 0x0a, 0x01, 0x00, // withdraw 10.1.0.0/24
+		0x00, 0x00, // total path attribute length 0
+	)
+	o := dispatchRaw(t, raw)
+	if _, ok := o.withdrawn["10.1.0.0/24"]; !ok {
+		t.Fatalf("10.1.0.0/24 not marked withdrawn")
+	}
+}
+
+// TestDispatch_KnownBytes_IPv6MPReach decodes a byte-literal RFC 4760
+// UPDATE carrying 2001:db8:1::/64 in MP_REACH_NLRI.
+func TestDispatch_KnownBytes_IPv6MPReach(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x45, // length 69
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x2e, // total path attribute length 46
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 4-octet AS
+		0x80, 0x0e, 0x1e, // MP_REACH_NLRI, length 30
+		0x00, 0x02, 0x01, // AFI 2 (IPv6) / SAFI 1 (unicast)
+		0x10, // next-hop length 16
+		0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // 2001:db8::1
+		0x00,                                                 // reserved
+		0x40, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0x00, 0x00, // 2001:db8:1::/64
+	)
+	o := dispatchRaw(t, raw)
+	if _, ok := o.firstSeen["2001:db8:1::/64"]; !ok {
+		t.Fatalf("2001:db8:1::/64 not observed; got %v", mapKeys(o.firstSeen))
+	}
+}
+
+// TestDispatch_KnownBytes_VPNv4MPReach decodes a byte-literal RFC 4364
+// / RFC 8277 UPDATE carrying RD 65000:1, label 0 (RFC 9252 section 4
+// no-transposition form), prefix 10.1.0.0/24 in MP_REACH_NLRI.
+func TestDispatch_KnownBytes_VPNv4MPReach(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x47, // length 71
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x30, // total path attribute length 48
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 4-octet AS
+		0x80, 0x0e, 0x20, // MP_REACH_NLRI, length 32
+		0x00, 0x01, 0x80, // AFI 1 (IPv4) / SAFI 128 (MPLS-labeled VPN)
+		0x0c, // next-hop length 12 (zeroed RD + IPv4 per RFC 4364 section 4.3.2)
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x0a, 0x00, 0x00, 0x01, // next-hop 10.0.0.1
+		0x00,             // reserved
+		0x70,             // NLRI length 112 bits: label(24) + RD(64) + prefix(24)
+		0x00, 0x00, 0x01, // label 0, bottom-of-stack
+		0x00, 0x00, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x01, // RD type 0, 65000:1
+		0x0a, 0x01, 0x00, // 10.1.0.0/24
+	)
+	o := dispatchRaw(t, raw)
+	if len(o.firstSeen) != 1 {
+		t.Fatalf("observed %d prefixes, want 1: %v", len(o.firstSeen), mapKeys(o.firstSeen))
+	}
+	if _, ok := o.firstSeen["65000:1:10.1.0.0/24"]; !ok {
+		t.Fatalf("VPNv4 NLRI not observed under expected key; got %v", mapKeys(o.firstSeen))
+	}
+}
+
+func mapKeys(m map[string]timing.Timestamp) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
