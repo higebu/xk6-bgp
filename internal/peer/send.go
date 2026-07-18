@@ -111,6 +111,10 @@ func (f *fsm) writeUpdates(withdraw bool, attrs packet.PathAttrs, routes []packe
 	if len(routes) == 0 {
 		return timing.Timestamp{}, 0, nil
 	}
+	// The negotiation outcome overrides whatever the caller put in the
+	// encoding: the AS_PATH octet size is a session property, not a
+	// per-advertise choice.
+	encoding.Use2ByteAS = !f.fourOctetASNegotiated
 	chunks, err := packet.ChunkRoutes(withdraw, attrs, routes, encoding)
 	if err != nil {
 		return timing.Timestamp{}, 0, err

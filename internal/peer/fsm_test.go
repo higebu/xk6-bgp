@@ -464,6 +464,68 @@ func TestFSM_BadPeerASNotificationSubcode(t *testing.T) {
 	}
 }
 
+// makePeerOpen builds the in-memory OPEN body a peer at AS 65000 would
+// send with the given capabilities.
+func makePeerOpen(t *testing.T, caps ...bgp.ParameterCapabilityInterface) *bgp.BGPOpen {
+	t.Helper()
+	msg, err := bgp.NewBGPOpenMessage(65000, 180, netip.MustParseAddr("10.0.0.2"),
+		[]bgp.OptionParameterInterface{bgp.NewOptionParameterCapability(caps)})
+	if err != nil {
+		t.Fatalf("NewBGPOpenMessage: %v", err)
+	}
+	return msg.Body.(*bgp.BGPOpen)
+}
+
+// TestAcceptPeerOpen_TwoByteASPeer verifies a peer that does not
+// advertise the RFC 6793 4-octet AS capability flips the session to
+// 2-octet AS_PATH handling.
+func TestAcceptPeerOpen_TwoByteASPeer(t *testing.T) {
+	cfg := Config{
+		LocalAS:  65001,
+		PeerAS:   65000,
+		RouterID: netip.MustParseAddr("10.0.0.1"),
+		Target:   "127.0.0.1:0",
+		Families: []bgp.Family{bgp.RF_IPv4_UC},
+	}
+	cfg.ApplyDefaults()
+	f := newFSM(cfg)
+
+	if err := f.acceptPeerOpen(makePeerOpen(t)); err != nil {
+		t.Fatalf("acceptPeerOpen: %v", err)
+	}
+	if f.fourOctetASNegotiated {
+		t.Fatal("fourOctetASNegotiated = true for a peer without capability 65")
+	}
+	if len(f.msgOpts) != 1 || !f.msgOpts[0].Use2ByteAS {
+		t.Fatalf("msgOpts = %v, want Use2ByteAS=true", f.msgOpts)
+	}
+}
+
+// TestAcceptPeerOpen_FourOctetASPeer verifies the default modern
+// session keeps msgOpts nil so Serialize/Parse stay on gobgp's
+// 4-octet AS default.
+func TestAcceptPeerOpen_FourOctetASPeer(t *testing.T) {
+	cfg := Config{
+		LocalAS:  65001,
+		PeerAS:   65000,
+		RouterID: netip.MustParseAddr("10.0.0.1"),
+		Target:   "127.0.0.1:0",
+		Families: []bgp.Family{bgp.RF_IPv4_UC},
+	}
+	cfg.ApplyDefaults()
+	f := newFSM(cfg)
+
+	if err := f.acceptPeerOpen(makePeerOpen(t, bgp.NewCapFourOctetASNumber(65000))); err != nil {
+		t.Fatalf("acceptPeerOpen: %v", err)
+	}
+	if !f.fourOctetASNegotiated {
+		t.Fatal("fourOctetASNegotiated = false for a peer with capability 65")
+	}
+	if f.msgOpts != nil {
+		t.Fatalf("msgOpts = %v, want nil on a 4-octet-AS session", f.msgOpts)
+	}
+}
+
 func TestConfigValidate_HoldTimeRange(t *testing.T) {
 	base := Config{
 		LocalAS:  65001,

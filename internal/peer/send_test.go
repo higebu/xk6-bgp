@@ -63,6 +63,9 @@ func TestWriteUpdatesChunking(t *testing.T) {
 	f := newFSM(cfg)
 	f.conn = c1
 	f.state.Store(int32(StateEstablished))
+	// A real session reaches writeUpdates only after acceptPeerOpen; a
+	// 4-octet-AS peer is the baseline this test models.
+	f.fourOctetASNegotiated = true
 
 	// 2000 distinct /32 NLRIs blow past the 4096-byte limit when
 	// packed with full IPv4-unicast path attrs (Origin / AS_PATH /

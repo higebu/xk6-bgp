@@ -383,6 +383,39 @@ func TestDispatch_KnownBytes_VPNv4MPReach(t *testing.T) {
 	}
 }
 
+// TestDispatch_KnownBytes_TwoByteASPath decodes a byte-literal UPDATE
+// from a peer that never negotiated the RFC 6793 4-octet AS capability
+// — the AS_PATH carries 2-octet AS numbers, which gobgp's default
+// 4-octet parse must reject and the Use2ByteAS option must accept.
+func TestDispatch_KnownBytes_TwoByteASPath(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x2d, // length 45
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x12, // total path attribute length 18
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x04, 0x02, 0x01, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 2-octet AS
+		0x40, 0x03, 0x04, 0x0a, 0x00, 0x00, 0x01, // NEXT_HOP 10.0.0.1
+		0x18, 0x0a, 0x01, 0x00, // 10.1.0.0/24
+	)
+	if _, err := bgp.ParseBGPMessage(raw); err == nil {
+		t.Fatal("expected the default 4-octet AS parse to reject a 2-octet AS_PATH")
+	}
+	msg, err := bgp.ParseBGPMessage(raw, &bgp.MarshallingOption{Use2ByteAS: true})
+	if err != nil {
+		t.Fatalf("ParseBGPMessage with Use2ByteAS: %v", err)
+	}
+	upd, ok := msg.Body.(*bgp.BGPUpdate)
+	if !ok {
+		t.Fatalf("parsed %T, want *bgp.BGPUpdate", msg.Body)
+	}
+	f := &fsm{observed: newObservedSet()}
+	f.dispatchUpdate(upd, timing.Now())
+	if _, ok := f.observed.firstSeen["10.1.0.0/24"]; !ok {
+		t.Fatalf("10.1.0.0/24 not observed; got %v", mapKeys(f.observed.firstSeen))
+	}
+}
+
 func mapKeys(m map[string]timing.Timestamp) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

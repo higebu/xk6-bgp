@@ -149,6 +149,22 @@ type EncodingOptions struct {
 	// `Bad Message Length`. The Peer's `extendedMessage: true`
 	// capability defaults already advertise it.
 	UseExtendedMessages bool
+	// Use2ByteAS is set by the peer layer when the remote peer did not
+	// advertise the RFC 6793 4-octet AS capability. AS_PATH is then
+	// encoded with 2-octet AS numbers (AS_TRANS for non-mappable ones,
+	// plus an AS4_PATH attribute) per RFC 6793 section 4.2.2, and the
+	// same option drives 2-octet AS_PATH decoding on receive.
+	Use2ByteAS bool
+}
+
+// marshallingOptions translates the session-negotiated fields into
+// gobgp MarshallingOptions. Returns nil in the default (4-octet AS)
+// case so the hot path stays allocation-free.
+func (o EncodingOptions) marshallingOptions() []*bgp.MarshallingOption {
+	if !o.Use2ByteAS {
+		return nil
+	}
+	return []*bgp.MarshallingOption{{Use2ByteAS: o.Use2ByteAS}}
 }
 
 // BGPExtendedMaxMessageLength is RFC 8654's relaxed max BGP message
@@ -176,7 +192,7 @@ func BuildUpdateMessage(withdraw bool, attrs PathAttrs, routes []Route, opts Enc
 	}
 
 	if family.Afi() == bgp.AFI_IP && family.Safi() == bgp.SAFI_UNICAST && !opts.UseMpReachForIPv4Unicast {
-		return buildIPv4UnicastUpdate(withdraw, attrs, nlris)
+		return buildIPv4UnicastUpdate(withdraw, attrs, nlris, opts)
 	}
 
 	if withdraw {
@@ -199,13 +215,9 @@ func BuildUpdateMessage(withdraw bool, attrs PathAttrs, routes []Route, opts Enc
 		return nil, fmt.Errorf("build MP_REACH_NLRI: %w", err)
 	}
 
-	pa := []bgp.PathAttributeInterface{
-		bgp.NewPathAttributeOrigin(attrs.Origin),
-		bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
-			bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, []uint32{attrs.LocalAS}),
-		}),
-		mpr,
-	}
+	pa := []bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(attrs.Origin)}
+	pa = append(pa, asPathAttributes(attrs.LocalAS, opts.Use2ByteAS)...)
+	pa = append(pa, mpr)
 	// RFC 4271 section 5 lists NEXT_HOP as well-known mandatory whenever an
 	// UPDATE advertises reachability. RFC 4760 section 3 lets MP_REACH carry
 	// its own next-hop and is silent about omitting NEXT_HOP, but
@@ -250,7 +262,37 @@ func BuildUpdateMessage(withdraw bool, attrs PathAttrs, routes []Route, opts Enc
 	return bgp.NewBGPUpdateMessage(nil, pa, nil), nil
 }
 
-func buildIPv4UnicastUpdate(withdraw bool, attrs PathAttrs, nlris []bgp.PathNLRI) (*bgp.BGPMessage, error) {
+// asPathAttributes builds the AS_PATH for the single-hop path xk6-bgp
+// originates. With a 2-octet-AS peer the AS_PATH is encoded with
+// 2-octet AS numbers, a non-mappable local AS becomes AS_TRANS, and
+// the real value travels in AS4_PATH per RFC 6793 section 4.2.2 (which
+// also forbids AS4_PATH when everything is mappable).
+func asPathAttributes(localAS uint32, use2ByteAS bool) []bgp.PathAttributeInterface {
+	if !use2ByteAS {
+		return []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+				bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, []uint32{localAS}),
+			}),
+		}
+	}
+	as2 := uint16(localAS) // #nosec G115 -- non-mappable values are replaced with AS_TRANS below per RFC 6793 section 4.2.2
+	if localAS > 0xffff {
+		as2 = bgp.AS_TRANS
+	}
+	pa := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+			bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, []uint16{as2}),
+		}),
+	}
+	if localAS > 0xffff {
+		pa = append(pa, bgp.NewPathAttributeAs4Path([]*bgp.As4PathParam{
+			bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, []uint32{localAS}),
+		}))
+	}
+	return pa
+}
+
+func buildIPv4UnicastUpdate(withdraw bool, attrs PathAttrs, nlris []bgp.PathNLRI, opts EncodingOptions) (*bgp.BGPMessage, error) {
 	if withdraw {
 		return bgp.NewBGPUpdateMessage(nlris, nil, nil), nil
 	}
@@ -267,13 +309,9 @@ func buildIPv4UnicastUpdate(withdraw bool, attrs PathAttrs, nlris []bgp.PathNLRI
 	if err != nil {
 		return nil, fmt.Errorf("build NEXT_HOP: %w", err)
 	}
-	pa := []bgp.PathAttributeInterface{
-		bgp.NewPathAttributeOrigin(attrs.Origin),
-		bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
-			bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, []uint32{attrs.LocalAS}),
-		}),
-		nh,
-	}
+	pa := []bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(attrs.Origin)}
+	pa = append(pa, asPathAttributes(attrs.LocalAS, opts.Use2ByteAS)...)
+	pa = append(pa, nh)
 	if attrs.MED != nil {
 		pa = append(pa, bgp.NewPathAttributeMultiExitDisc(*attrs.MED))
 	}
@@ -307,8 +345,9 @@ func buildIPv4UnicastUpdate(withdraw bool, attrs PathAttrs, nlris []bgp.PathNLRI
 // in fact negotiated Extended Messages, otherwise the receiver will
 // drop the session.
 func SerializeMessage(msg *bgp.BGPMessage, opts EncodingOptions) ([]byte, error) {
+	mo := opts.marshallingOptions()
 	if opts.UseExtendedMessages {
-		body, err := msg.Body.Serialize()
+		body, err := msg.Body.Serialize(mo...)
 		if err != nil {
 			return nil, err
 		}
@@ -319,7 +358,7 @@ func SerializeMessage(msg *bgp.BGPMessage, opts EncodingOptions) ([]byte, error)
 		}
 		msg.Header.Len = uint16(total)
 	}
-	return msg.Serialize()
+	return msg.Serialize(mo...)
 }
 
 // ChunkRoutes splits routes into the largest possible sub-slices such

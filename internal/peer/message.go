@@ -57,8 +57,8 @@ func BuildNotification(code, subcode uint8, data []byte) *bgp.BGPMessage {
 // 4096-byte cap on the message length; for sessions that negotiated
 // RFC 8654 Extended Messages use ReadMessageMax with the higher cap.
 // Callers that just want to re-emit can skip Serialize.
-func ReadMessage(r io.Reader) ([]byte, *bgp.BGPMessage, error) {
-	raw, msg, _, err := ReadMessageMax(r, bgp.BGP_MAX_MESSAGE_LENGTH)
+func ReadMessage(r io.Reader, options ...*bgp.MarshallingOption) ([]byte, *bgp.BGPMessage, error) {
+	raw, msg, _, err := ReadMessageMax(r, bgp.BGP_MAX_MESSAGE_LENGTH, options...)
 	return raw, msg, err
 }
 
@@ -70,7 +70,10 @@ func ReadMessage(r io.Reader) ([]byte, *bgp.BGPMessage, error) {
 // The returned Timestamp is captured right after the last byte of the
 // message is read, before ParseBGPMessage — for a large UPDATE the
 // parse cost must not leak into bgp_prefix_received_duration.
-func ReadMessageMax(r io.Reader, maxLen int) ([]byte, *bgp.BGPMessage, timing.Timestamp, error) {
+// options must carry the session's negotiated MarshallingOption when
+// a 2-octet-AS peer is in play, otherwise the AS_PATH bytes are
+// misparsed.
+func ReadMessageMax(r io.Reader, maxLen int, options ...*bgp.MarshallingOption) ([]byte, *bgp.BGPMessage, timing.Timestamp, error) {
 	var hdr [bgp.BGP_HEADER_LENGTH]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, nil, timing.Timestamp{}, err
@@ -95,7 +98,7 @@ func ReadMessageMax(r io.Reader, maxLen int) ([]byte, *bgp.BGPMessage, timing.Ti
 		}
 	}
 	ts := timing.Now()
-	msg, err := bgp.ParseBGPMessage(full)
+	msg, err := bgp.ParseBGPMessage(full, options...)
 	if err != nil {
 		return full, nil, ts, err
 	}

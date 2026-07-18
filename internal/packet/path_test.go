@@ -432,3 +432,69 @@ func TestBuildUpdateMessage_MPFamilyNoNextHopAttr(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildUpdateMessage_Use2ByteAS checks RFC 6793 section 4.2.2
+// encoding toward an OLD (2-octet AS) peer: mappable local AS numbers
+// go into a 2-octet AS_PATH with no AS4_PATH; a non-mappable one
+// becomes AS_TRANS in AS_PATH with the real value in AS4_PATH.
+func TestBuildUpdateMessage_Use2ByteAS(t *testing.T) {
+	cases := []struct {
+		name       string
+		localAS    uint32
+		wantASPath uint32
+		wantAs4    bool
+	}{
+		{"mappable", 65001, 65001, false},
+		{"non-mappable", 4200000000, bgp.AS_TRANS, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := EncodingOptions{Use2ByteAS: true}
+			msg, err := BuildUpdateMessage(false,
+				PathAttrs{NextHop: parseAddr("10.0.0.1"), LocalAS: tc.localAS},
+				ipRoutes(bgp.RF_IPv4_UC, "10.100.0.0/24"), opts)
+			if err != nil {
+				t.Fatalf("BuildUpdateMessage: %v", err)
+			}
+			buf, err := SerializeMessage(msg, opts)
+			if err != nil {
+				t.Fatalf("SerializeMessage: %v", err)
+			}
+			parsed, err := bgp.ParseBGPMessage(buf, &bgp.MarshallingOption{Use2ByteAS: true})
+			if err != nil {
+				t.Fatalf("ParseBGPMessage: %v", err)
+			}
+			upd := parsed.Body.(*bgp.BGPUpdate)
+
+			var asPath *bgp.PathAttributeAsPath
+			var as4Path *bgp.PathAttributeAs4Path
+			for _, a := range upd.PathAttributes {
+				switch v := a.(type) {
+				case *bgp.PathAttributeAsPath:
+					asPath = v
+				case *bgp.PathAttributeAs4Path:
+					as4Path = v
+				}
+			}
+			if asPath == nil || len(asPath.Value) != 1 {
+				t.Fatalf("AS_PATH missing or malformed: %v", asPath)
+			}
+			if _, ok := asPath.Value[0].(*bgp.AsPathParam); !ok {
+				t.Fatalf("AS_PATH param is %T, want 2-octet *bgp.AsPathParam", asPath.Value[0])
+			}
+			if got := asPath.Value[0].GetAS(); len(got) != 1 || got[0] != tc.wantASPath {
+				t.Fatalf("AS_PATH = %v, want [%d]", got, tc.wantASPath)
+			}
+			if tc.wantAs4 {
+				if as4Path == nil || len(as4Path.Value) != 1 {
+					t.Fatalf("AS4_PATH missing for non-mappable AS")
+				}
+				if got := as4Path.Value[0].GetAS(); len(got) != 1 || got[0] != tc.localAS {
+					t.Fatalf("AS4_PATH = %v, want [%d]", got, tc.localAS)
+				}
+			} else if as4Path != nil {
+				t.Fatal("AS4_PATH present for a mappable AS (RFC 6793 section 4.2.2 forbids it)")
+			}
+		})
+	}
+}

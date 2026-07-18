@@ -121,6 +121,12 @@ Negotiated by default in OPEN:
 - Graceful Restart with N-bit ([RFC 4724](https://www.rfc-editor.org/rfc/rfc4724.txt) + [RFC 8538](https://www.rfc-editor.org/rfc/rfc8538.txt))
 - 4-octet AS ([RFC 6793](https://www.rfc-editor.org/rfc/rfc6793.txt))
 
+When a peer does not advertise the 4-octet AS capability, xk6-bgp
+follows [RFC 6793 § 4.2.2](https://www.rfc-editor.org/rfc/rfc6793.txt):
+AS_PATH is sent with 2-octet AS numbers (a non-mappable local AS
+becomes `AS_TRANS` with the real value in AS4_PATH), and received
+2-octet AS_PATHs are decoded accordingly.
+
 ## API
 
 The JS API is synchronous: each Peer method blocks the calling VU

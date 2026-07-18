@@ -84,6 +84,12 @@ type fsm struct {
 	peerAS                     uint32
 	peerCaps                   []bgp.ParameterCapabilityInterface
 	extendedMessagesNegotiated bool
+	fourOctetASNegotiated      bool
+	// msgOpts carries the negotiation outcome (2-octet AS_PATH
+	// handling) into every gobgp Serialize/Parse call. Built once in
+	// acceptPeerOpen; nil on the default 4-octet-AS session so the hot
+	// path stays allocation-free.
+	msgOpts []*bgp.MarshallingOption
 
 	loopCtx    context.Context
 	loopCancel context.CancelFunc
@@ -276,6 +282,7 @@ func (f *fsm) acceptPeerOpen(m *bgp.BGPOpen) error {
 		for _, c := range ocp.Capability {
 			if four, ok := c.(*bgp.CapFourOctetASNumber); ok {
 				f.peerAS = four.CapValue // RFC 6793: overrides 2-octet MyAS
+				f.fourOctetASNegotiated = true
 			}
 			// RFC 8654 section 3: Extended Messages applies only when both sides
 			// advertised capability code 6.
@@ -284,6 +291,10 @@ func (f *fsm) acceptPeerOpen(m *bgp.BGPOpen) error {
 			}
 			f.peerCaps = append(f.peerCaps, c)
 		}
+	}
+
+	if !f.fourOctetASNegotiated {
+		f.msgOpts = []*bgp.MarshallingOption{{Use2ByteAS: true}}
 	}
 
 	if f.cfg.PeerAS != 0 && f.peerAS != f.cfg.PeerAS {
@@ -298,7 +309,7 @@ func (f *fsm) acceptPeerOpen(m *bgp.BGPOpen) error {
 // writeMessage serializes msg and writes it under writeMu so concurrent
 // VUs and the keepalive goroutine never interleave bytes on the packet.
 func (f *fsm) writeMessage(msg *bgp.BGPMessage) error {
-	buf, err := msg.Serialize()
+	buf, err := msg.Serialize(f.msgOpts...)
 	if err != nil {
 		return fmt.Errorf("BGP serialize: %w", err)
 	}
@@ -347,7 +358,7 @@ func (f *fsm) readLoop() {
 		if f.extendedMessagesNegotiated {
 			maxLen = packet.BGPExtendedMaxMessageLength
 		}
-		_, msg, ts, err := ReadMessageMax(f.conn, maxLen)
+		_, msg, ts, err := ReadMessageMax(f.conn, maxLen, f.msgOpts...)
 		if err != nil {
 			if f.loopCtx.Err() != nil {
 				return
