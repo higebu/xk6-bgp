@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"time"
 
 	bgp "github.com/osrg/gobgp/v4/pkg/packet/bgp"
 
@@ -46,6 +47,13 @@ func (c *Config) Validate() error {
 	}
 	if len(c.Families) == 0 {
 		return errors.New("at least one address family is required")
+	}
+	// RFC 4271 section 4.2: HoldTime is a 2-octet seconds field and
+	// MUST be 0 or at least 3. 0 here means "unset" (ApplyDefaults
+	// fills it in), so only the explicit values are checked; without
+	// this the uint16 conversion in BuildOpen would silently wrap.
+	if hs := c.Timers.HoldTime / time.Second; hs != 0 && (hs < 3 || hs > 65535) {
+		return fmt.Errorf("holdtime must be 0 or between 3s and 65535s, got %s", c.Timers.HoldTime)
 	}
 	for i, f := range c.Families {
 		if f == 0 {

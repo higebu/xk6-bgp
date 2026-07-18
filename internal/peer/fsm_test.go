@@ -463,3 +463,24 @@ func TestFSM_BadPeerASNotificationSubcode(t *testing.T) {
 		t.Fatal("peer never received a NOTIFICATION")
 	}
 }
+
+func TestConfigValidate_HoldTimeRange(t *testing.T) {
+	base := Config{
+		LocalAS:  65001,
+		RouterID: netip.MustParseAddr("10.0.0.1"),
+		Target:   "127.0.0.1:179",
+		Families: []bgp.Family{bgp.RF_IPv4_UC},
+	}
+	for _, d := range []time.Duration{time.Second, 2 * time.Second, 65536 * time.Second} {
+		cfg := base
+		cfg.Timers.HoldTime = d
+		if _, err := New(cfg); err == nil {
+			t.Errorf("HoldTime=%s: expected validation error, got nil", d)
+		}
+	}
+	ok := base
+	ok.Timers.HoldTime = 3 * time.Second
+	if _, err := New(ok); err != nil {
+		t.Errorf("HoldTime=3s: unexpected error: %v", err)
+	}
+}
