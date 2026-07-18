@@ -121,9 +121,6 @@ func (f *fsm) writeUpdates(withdraw bool, attrs packet.PathAttrs, routes []packe
 		interval = time.Duration(float64(time.Second) / updateRate)
 	}
 
-	f.writeMu.Lock()
-	defer f.writeMu.Unlock()
-
 	var firstTs timing.Timestamp
 	total := 0
 	for i, chunk := range chunks {
@@ -135,8 +132,16 @@ func (f *fsm) writeUpdates(withdraw bool, attrs packet.PathAttrs, routes []packe
 		if err != nil {
 			return firstTs, total, fmt.Errorf("serialize: %w", err)
 		}
+		// Lock per chunk, not across the whole batch: messages are
+		// atomic units, so a KEEPALIVE interleaving between two UPDATEs
+		// is fine — and with a low updateRate the keepalive goroutine
+		// must be able to grab writeMu during the drip, or the DUT's
+		// hold timer expires mid-advertise.
+		f.writeMu.Lock()
 		ts := timing.Now()
-		if _, err := f.conn.Write(buf); err != nil {
+		_, err = f.conn.Write(buf)
+		f.writeMu.Unlock()
+		if err != nil {
 			return firstTs, total, fmt.Errorf("write: %w", err)
 		}
 		if firstTs.Time().IsZero() {
