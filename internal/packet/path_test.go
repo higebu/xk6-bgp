@@ -399,3 +399,36 @@ func TestBuildUpdateMessage_IPv6AdvertiseNoIPv4NextHop(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildUpdateMessage_MPFamilyNoNextHopAttr verifies that MP
+// families other than IPv4 unicast (here VPNv4 with an IPv4 next-hop)
+// carry the next-hop only inside MP_REACH_NLRI per RFC 4760 section 3
+// and never a top-level NEXT_HOP attribute — that workaround is
+// reserved for MP_REACH-encoded IPv4 unicast.
+func TestBuildUpdateMessage_MPFamilyNoNextHopAttr(t *testing.T) {
+	rd := mustRD(t, "65000:1")
+	r, err := NewVPNIPRoute(bgp.RF_IPv4_VPN, rd, netip.MustParsePrefix("10.1.0.0/24"))
+	if err != nil {
+		t.Fatalf("NewVPNIPRoute: %v", err)
+	}
+	msg, err := BuildUpdateMessage(false,
+		PathAttrs{NextHop: parseAddr("10.0.0.1"), LocalAS: 65001},
+		[]Route{r}, EncodingOptions{})
+	if err != nil {
+		t.Fatalf("BuildUpdateMessage: %v", err)
+	}
+	buf, err := msg.Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+	parsed, err := bgp.ParseBGPMessage(buf)
+	if err != nil {
+		t.Fatalf("ParseBGPMessage: %v", err)
+	}
+	upd := parsed.Body.(*bgp.BGPUpdate)
+	for _, a := range upd.PathAttributes {
+		if _, ok := a.(*bgp.PathAttributeNextHop); ok {
+			t.Fatal("unexpected NEXT_HOP attribute in VPNv4 UPDATE")
+		}
+	}
+}

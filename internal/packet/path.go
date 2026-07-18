@@ -212,9 +212,11 @@ func BuildUpdateMessage(withdraw bool, attrs PathAttrs, routes []Route, opts Enc
 	// strict receivers (FRR among them) reject an MP_REACH IPv4
 	// unicast UPDATE that is then re-encoded into the traditional
 	// NLRI form without NEXT_HOP. Emit NEXT_HOP alongside MP_REACH
-	// for IPv4 next-hops so the route survives re-advertisement
-	// through such receivers.
-	if attrs.NextHop.Is4() || attrs.NextHop.Is4In6() {
+	// for IPv4 unicast only — other MP families (VPN, MUP, EVPN)
+	// carry their next-hop exclusively in MP_REACH and a top-level
+	// NEXT_HOP there is spurious.
+	if family.Afi() == bgp.AFI_IP && family.Safi() == bgp.SAFI_UNICAST &&
+		(attrs.NextHop.Is4() || attrs.NextHop.Is4In6()) {
 		nh, err := bgp.NewPathAttributeNextHop(attrs.NextHop)
 		if err != nil {
 			return nil, fmt.Errorf("build NEXT_HOP: %w", err)
