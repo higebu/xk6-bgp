@@ -20,6 +20,9 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: go build
+        run: go build ./...
+
       - name: go vet
         run: go vet ./...
 
