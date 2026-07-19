@@ -535,6 +535,103 @@ func TestDispatch_KnownBytes_TwoByteASPath(t *testing.T) {
 	}
 }
 
+// TestDispatch_KnownBytes_EVPNMacIPAdvertisement decodes a byte-literal
+// RFC 7432 section 7.2 UPDATE carrying an EVPN Type 2 (MAC/IP
+// Advertisement) route: RD 65000:1, single-homed ESI, Ethernet Tag 100,
+// MAC aa:bb:cc:dd:ee:01, IP 10.1.1.1, one label (10100).
+func TestDispatch_KnownBytes_EVPNMacIPAdvertisement(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x57, // length 87
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x40, // total path attribute length 64
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 4-octet AS
+		0x80, 0x0e, 0x30, // MP_REACH_NLRI, length 48
+		0x00, 0x19, 0x46, // AFI 25 (L2VPN) / SAFI 70 (EVPN)
+		0x04,                   // next-hop length 4
+		0x0a, 0x00, 0x00, 0x01, // next-hop 10.0.0.1
+		0x00,       // reserved
+		0x02, 0x25, // EVPN NLRI: route type 2 (MAC/IP Advertisement), length 37
+		0x00, 0x00, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x01, // RD type 0, 65000:1
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ESI (single-homed)
+		0x00, 0x00, 0x00, 0x64, // Ethernet Tag ID 100
+		0x30,                               // MAC address length 48
+		0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01, // MAC aa:bb:cc:dd:ee:01
+		0x20,                   // IP address length 32
+		0x0a, 0x01, 0x01, 0x01, // IP 10.1.1.1
+		0x00, 0x27, 0x74, // MPLS Label1 10100 (VNI-style; no BOS shift for EVPN labels)
+	)
+	o := dispatchRaw(t, raw)
+	want := "[type:macadv][rd:65000:1][etag:100][mac:aa:bb:cc:dd:ee:01][ip:10.1.1.1]"
+	if _, ok := o.firstSeen[want]; !ok {
+		t.Errorf("EVPN MAC/IP route not observed under %q; got %v", want, mapKeys(o.firstSeen))
+	}
+}
+
+// TestDispatch_KnownBytes_EVPNInclusiveMulticastEthernetTag decodes a
+// byte-literal RFC 7432 section 7.3 UPDATE carrying an EVPN Type 3
+// (Inclusive Multicast Ethernet Tag) route: RD 65000:1, Ethernet Tag
+// 200, originating router IP 10.0.0.1.
+func TestDispatch_KnownBytes_EVPNInclusiveMulticastEthernetTag(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x43, // length 67
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x2c, // total path attribute length 44
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 4-octet AS
+		0x80, 0x0e, 0x1c, // MP_REACH_NLRI, length 28
+		0x00, 0x19, 0x46, // AFI 25 (L2VPN) / SAFI 70 (EVPN)
+		0x04,                   // next-hop length 4
+		0x0a, 0x00, 0x00, 0x01, // next-hop 10.0.0.1
+		0x00,       // reserved
+		0x03, 0x11, // EVPN NLRI: route type 3 (Inclusive Multicast Ethernet Tag), length 17
+		0x00, 0x00, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x01, // RD type 0, 65000:1
+		0x00, 0x00, 0x00, 0xc8, // Ethernet Tag ID 200
+		0x20,                   // originating router IP address length 32
+		0x0a, 0x00, 0x00, 0x01, // originating router IP 10.0.0.1
+	)
+	o := dispatchRaw(t, raw)
+	want := "[type:multicast][rd:65000:1][etag:200][ip:10.0.0.1]"
+	if _, ok := o.firstSeen[want]; !ok {
+		t.Errorf("EVPN IMET route not observed under %q; got %v", want, mapKeys(o.firstSeen))
+	}
+}
+
+// TestDispatch_KnownBytes_EVPNIPPrefix decodes a byte-literal RFC 9136
+// section 3 UPDATE carrying an EVPN Type 5 (IP Prefix) route: RD
+// 65000:1, Ethernet Tag 300, prefix 10.1.0.0/24, zero GW IP, label
+// 50100.
+func TestDispatch_KnownBytes_EVPNIPPrefix(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x54, // length 84
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x3d, // total path attribute length 61
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 4-octet AS
+		0x80, 0x0e, 0x2d, // MP_REACH_NLRI, length 45
+		0x00, 0x19, 0x46, // AFI 25 (L2VPN) / SAFI 70 (EVPN)
+		0x04,                   // next-hop length 4
+		0x0a, 0x00, 0x00, 0x01, // next-hop 10.0.0.1
+		0x00,       // reserved
+		0x05, 0x22, // EVPN NLRI: route type 5 (IP Prefix), length 34
+		0x00, 0x00, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x01, // RD type 0, 65000:1
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ESI (single-homed)
+		0x00, 0x00, 0x01, 0x2c, // Ethernet Tag ID 300
+		0x18,                   // IP prefix length 24
+		0x0a, 0x01, 0x00, 0x00, // IP prefix 10.1.0.0
+		0x00, 0x00, 0x00, 0x00, // GW IP 0.0.0.0 (unused)
+		0x00, 0xc3, 0xb4, // MPLS Label 50100
+	)
+	o := dispatchRaw(t, raw)
+	want := "[type:Prefix][rd:65000:1][etag:300][prefix:10.1.0.0/24]"
+	if _, ok := o.firstSeen[want]; !ok {
+		t.Errorf("EVPN IP Prefix route not observed under %q; got %v", want, mapKeys(o.firstSeen))
+	}
+}
+
 func mapKeys(m map[string]timing.Timestamp) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
