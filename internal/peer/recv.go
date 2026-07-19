@@ -168,8 +168,18 @@ func (o *observedSet) registerWaiter(want []string, onlyAfter timing.Timestamp) 
 			if w.first.Time().IsZero() || fs.Time().Before(w.first.Time()) {
 				w.first = fs
 			}
-			if w.last.Time().IsZero() || o.lastUpdateAt.Time().After(w.last.Time()) {
-				w.last = o.lastUpdateAt
+			// Use fs, not o.lastUpdateAt: the latter is the timestamp
+			// of whatever UPDATE this observedSet processed most
+			// recently, which may belong to an unrelated prefix and
+			// would otherwise skew LastSeen (and therefore
+			// bgp_prefix_received_duration) later than this prefix
+			// was actually observed. fs undercounts only when p was
+			// withdrawn and re-advertised, since firstSeen is sticky
+			// to the first-ever observation — acceptable given the
+			// onlyAfter cutoff already treats that case as out of
+			// scope (see TestWaitForPrefixes_OnlyAfter).
+			if w.last.Time().IsZero() || fs.Time().After(w.last.Time()) {
+				w.last = fs
 			}
 			continue
 		}

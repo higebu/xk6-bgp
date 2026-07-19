@@ -232,6 +232,34 @@ func TestWaitForPrefixes_OnlyAfter(t *testing.T) {
 	}
 }
 
+// TestWaitForPrefixes_LastSeenNotSkewedByUnrelatedUpdate verifies that
+// LastSeen for a prefix already observed at registration time reflects
+// that prefix's own FirstSeen, not a later UPDATE for an unrelated
+// prefix that happened to bump the observedSet's lastUpdateAt.
+func TestWaitForPrefixes_LastSeenNotSkewedByUnrelatedUpdate(t *testing.T) {
+	o := newObservedSet()
+	cfg := Config{LocalAS: 65001, Target: "127.0.0.1:0", RouterID: netip.MustParseAddr("10.0.0.1"), Families: []bgp.Family{bgp.RF_IPv4_UC}}
+	cfg.ApplyDefaults()
+	p := &Peer{cfg: cfg, fsm: &fsm{observed: o}}
+	p.fsm.state.Store(int32(StateEstablished))
+
+	tA := timing.Now()
+	o.applyUpdate(bgp.RF_IPv4_UC, false, tA, mustPathNLRIs(t, "10.20.0.0/24"), nil)
+
+	time.Sleep(5 * time.Millisecond)
+	// An unrelated prefix observed later bumps o.lastUpdateAt well past tA.
+	o.applyUpdate(bgp.RF_IPv4_UC, false, timing.Now(), mustPathNLRIs(t, "10.20.99.0/24"), nil)
+
+	res, err := p.WaitForPrefixes([]string{"10.20.0.0/24"}, time.Second, timing.Timestamp{})
+	if err != nil {
+		t.Fatalf("WaitForPrefixes: %v", err)
+	}
+	if !res.LastSeen.Time().Equal(tA.Time()) {
+		t.Fatalf("LastSeen = %v, want %v (the prefix's own observation, not skewed by the later unrelated UPDATE)",
+			res.LastSeen.Time(), tA.Time())
+	}
+}
+
 // TestWaitForPrefixes_SessionFailureWakesWaiter verifies a session-
 // fatal error releases a blocked waiter immediately instead of letting
 // it run out the full timeout.
