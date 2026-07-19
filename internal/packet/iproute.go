@@ -55,8 +55,8 @@ func MustIPRoute(family bgp.Family, prefix netip.Prefix) IPRoute {
 	return r
 }
 
-func (r IPRoute) Family() bgp.Family { return r.family }
-func (r IPRoute) NLRI() bgp.NLRI     { return r.nlri }
+func (r IPRoute) Family() bgp.Family   { return r.family }
+func (r IPRoute) NLRI() bgp.NLRI       { return r.nlri }
 func (r IPRoute) Prefix() netip.Prefix { return r.prefix }
 
 // WireLen returns the on-the-wire byte length for an IP-prefix NLRI:

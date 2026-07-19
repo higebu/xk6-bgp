@@ -7,8 +7,8 @@ import (
 
 	bgp "github.com/osrg/gobgp/v4/pkg/packet/bgp"
 
-	"github.com/higebu/xk6-bgp/internal/timing"
 	"github.com/higebu/xk6-bgp/internal/packet"
+	"github.com/higebu/xk6-bgp/internal/timing"
 )
 
 type AdvertiseRequest struct {

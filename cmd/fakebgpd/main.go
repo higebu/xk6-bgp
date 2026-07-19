@@ -18,8 +18,8 @@ import (
 
 	bgp "github.com/osrg/gobgp/v4/pkg/packet/bgp"
 
-	xpeer "github.com/higebu/xk6-bgp/internal/peer"
 	"github.com/higebu/xk6-bgp/internal/packet"
+	xpeer "github.com/higebu/xk6-bgp/internal/peer"
 )
 
 type hub struct {

@@ -30,7 +30,7 @@ type observedSet struct {
 	withdrawn map[string]struct{}
 
 	updateSeq    uint64
-	advertiseN    uint64
+	advertiseN   uint64
 	withdrawN    uint64
 	lastUpdateAt timing.Timestamp
 	firstUpdate  timing.Timestamp
@@ -291,7 +291,7 @@ func (p *Peer) WaitForPrefixes(want []string, timeout time.Duration, onlyAfter t
 // Stats is a snapshot of cumulative receive counters. Cheap to call.
 type Stats struct {
 	Updates        uint64
-	AdvertisedNLRI  uint64
+	AdvertisedNLRI uint64
 	WithdrawnNLRI  uint64
 	UniquePrefixes int
 	FirstUpdateAt  timing.Timestamp
@@ -307,7 +307,7 @@ func (p *Peer) Stats() Stats {
 	defer o.mu.Unlock()
 	return Stats{
 		Updates:        o.updateSeq,
-		AdvertisedNLRI:  o.advertiseN,
+		AdvertisedNLRI: o.advertiseN,
 		WithdrawnNLRI:  o.withdrawN,
 		UniquePrefixes: len(o.firstSeen),
 		FirstUpdateAt:  o.firstUpdate,
