@@ -152,9 +152,6 @@ func parsePeerConfig(rt *sobek.Runtime, obj *sobek.Object) (peer.Config, map[str
 		if cfg.Timers.HoldTime, err = optDuration(tobj, "holdtime"); err != nil {
 			return cfg, nil, fmt.Errorf("timers.holdtime: %w", err)
 		}
-		if cfg.Timers.ConnectRetry, err = optDuration(tobj, "connectRetry"); err != nil {
-			return cfg, nil, fmt.Errorf("timers.connectRetry: %w", err)
-		}
 		if cfg.Timers.OpenTimeout, err = optDuration(tobj, "openTimeout"); err != nil {
 			return cfg, nil, fmt.Errorf("timers.openTimeout: %w", err)
 		}

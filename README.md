@@ -157,7 +157,7 @@ goroutine, so blocking in one VU does not block others.
 | `target` | string | — | `host:port` of the BGP speaker (required) |
 | `families` | string[] | — | AFI/SAFI list, e.g. `['ipv4-unicast', 'ipv6-unicast']` (required) |
 | `localAddress` | string | unset | Source IP for the outbound TCP connection; used by `throughput.js` / `multi_peer.js` to drive many sessions from distinct loopback aliases |
-| `timers` | object | defaults | `{ keepalive, holdtime, connectRetry, openTimeout }` as k6 duration strings |
+| `timers` | object | defaults | `{ keepalive, holdtime, openTimeout }` as k6 duration strings |
 | `capabilities` | object | see note | Per-capability overrides: `{ extendedMessage, routeRefresh, enhancedRouteRefresh, gracefulRestart, addPath }`. `extendedMessage`, `routeRefresh`, and `gracefulRestart` default on; `enhancedRouteRefresh` and `addPath` default off. `addPath` maps family strings to `'receive'` / `'send'` / `'both'` (see [Capabilities](#capabilities)) |
 | `tags` | object | unset | Key-value pairs added to every metric this Peer emits. `tags.peer` becomes the `peer` label |
 
