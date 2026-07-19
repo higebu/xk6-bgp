@@ -42,7 +42,7 @@ function mkPeer(role, localAs, routerId) {
     peerAs:   PEER_AS,
     routerId: routerId,
     target:   TARGET,
-    families: ['l3vpn-ipv4'],
+    families: ['l3vpn-ipv4-unicast'],
     tags:     { peer: role },
     timers: {
       holdtime:    '90s',
@@ -72,7 +72,7 @@ export default function () {
   }
 
   const adv = sender.advertise({
-    family:         'l3vpn-ipv4',
+    family:         'l3vpn-ipv4-unicast',
     nextHop:        '10.0.0.1',
     localAs:        SENDER_AS,
     extCommunities: [`rt:${RT}`],
