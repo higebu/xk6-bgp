@@ -90,7 +90,8 @@ func main() {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("accept: %v", err)
+			continue
 		}
 		go handleConn(conn, h, uint32(*myAS), *rid, families, *reflectMode, *addPath) // #nosec G115 -- AS values are bounded by RFC 6793; out-of-range is a CLI misuse, not a vulnerability
 	}
@@ -120,6 +121,8 @@ func handleConn(conn net.Conn, h *hub, myAS uint32, rid string, families []bgp.F
 	defer conn.Close()
 	log.Printf("accepted %s", conn.RemoteAddr())
 
+	const holdTime = 90 * time.Second
+
 	var peerOpen *bgp.BGPOpen
 	if _, msg, err := xpeer.ReadMessage(conn); err != nil {
 		log.Printf("%s: read OPEN: %v", conn.RemoteAddr(), err)
@@ -130,6 +133,11 @@ func handleConn(conn net.Conn, h *hub, myAS uint32, rid string, families []bgp.F
 		log.Printf("%s: expected OPEN, got %T", conn.RemoteAddr(), msg.Body)
 		return
 	}
+
+	// RFC 4271 section 4.2: HoldTime is min(local, peer); 0 disables the
+	// hold timer.
+	localHold := uint16(holdTime / time.Second) // #nosec G115 -- holdTime is a fixed 90s constant, well within the 2-octet field
+	negotiatedHold := time.Duration(min(localHold, peerOpen.HoldTime)) * time.Second
 
 	caps := packet.CapsConfig{
 		Families:        families,
@@ -148,7 +156,7 @@ func handleConn(conn net.Conn, h *hub, myAS uint32, rid string, families []bgp.F
 		}
 	}
 
-	open, err := xpeer.BuildOpen(myAS, 90*time.Second, netip.MustParseAddr(rid), caps)
+	open, err := xpeer.BuildOpen(myAS, holdTime, netip.MustParseAddr(rid), caps)
 	if err != nil {
 		log.Printf("%s: BuildOpen: %v", conn.RemoteAddr(), err)
 		return
@@ -191,6 +199,9 @@ func handleConn(conn net.Conn, h *hub, myAS uint32, rid string, families []bgp.F
 
 	updates := 0
 	for {
+		if negotiatedHold > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(negotiatedHold))
+		}
 		raw, msg, err := xpeer.ReadMessage(conn, rxOpts...)
 		if err != nil {
 			log.Printf("%s: read: %v (UPDATEs=%d)", conn.RemoteAddr(), err, updates)
