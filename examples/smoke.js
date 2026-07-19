@@ -36,7 +36,6 @@ export default function () {
     target:   TARGET,
     families: ['ipv4-unicast'],
     timers: {
-      keepalive:   '30s',
       holdtime:    '90s',
       openTimeout: '5s',
     },

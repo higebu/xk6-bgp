@@ -79,7 +79,6 @@ export default function () {
     families:     [FAMILY],
     tags:         { peer: 'vu-' + vu },
     timers: {
-      keepalive:   '30s',
       holdtime:    '90s',
       // 1000 simultaneous OPENs queue inside the DUT — gobgpd in
       // particular serializes them well beyond the default 10 s

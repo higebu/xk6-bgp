@@ -110,7 +110,6 @@ function mkPeer(role, localAs, routerId, target, peerAs, localAddress) {
     families:     [FAMILY],
     tags:         { peer: role },
     timers: {
-      keepalive:   '30s',
       holdtime:    '90s',
       openTimeout: '10s',
     },

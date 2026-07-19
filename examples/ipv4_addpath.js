@@ -41,7 +41,6 @@ function mkPeer(role, localAs, routerId) {
     families: ['ipv4-unicast'],
     tags:     { peer: role },
     timers: {
-      keepalive:   '30s',
       holdtime:    '90s',
       openTimeout: '5s',
     },

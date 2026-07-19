@@ -146,9 +146,6 @@ func parsePeerConfig(rt *sobek.Runtime, obj *sobek.Object) (peer.Config, map[str
 	if v := obj.Get("timers"); !common.IsNullish(v) {
 		tobj := v.ToObject(rt)
 		var err error
-		if cfg.Timers.Keepalive, err = optDuration(tobj, "keepalive"); err != nil {
-			return cfg, nil, fmt.Errorf("timers.keepalive: %w", err)
-		}
 		if cfg.Timers.HoldTime, err = optDuration(tobj, "holdtime"); err != nil {
 			return cfg, nil, fmt.Errorf("timers.holdtime: %w", err)
 		}

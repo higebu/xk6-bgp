@@ -103,7 +103,6 @@ function mkPeer(role, localAs, routerId, target, peerAs, localAddress) {
     families:     [FAMILY],
     tags:         { peer: role },
     timers: {
-      keepalive:   '30s',
       holdtime:    '90s',
       // 100 simultaneous OPENs queue inside the DUT — gobgpd in
       // particular serializes them well beyond the default 10 s

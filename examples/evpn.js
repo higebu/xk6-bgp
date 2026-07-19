@@ -49,7 +49,6 @@ function mkPeer(role, localAs, routerId) {
     families: ['l2vpn-evpn'],
     tags:     { peer: role },
     timers: {
-      keepalive:   '30s',
       holdtime:    '90s',
       openTimeout: '5s',
     },

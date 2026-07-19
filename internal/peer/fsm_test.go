@@ -132,7 +132,6 @@ func newTestPeer(t *testing.T, target string) *Peer {
 		Target:   target,
 		Families: []bgp.Family{bgp.RF_IPv4_UC},
 		Timers: SessionTimers{
-			Keepalive:   30 * time.Second,
 			HoldTime:    90 * time.Second,
 			OpenTimeout: 2 * time.Second,
 		},
