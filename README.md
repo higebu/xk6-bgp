@@ -169,6 +169,7 @@ goroutine, so blocking in one VU does not block others.
 | `peer.advertise(opts)` | `{ count, sentAtWallNs, sentAtMonoNs }` | Send MP_REACH UPDATEs |
 | `peer.withdraw(opts)` | `{ count, sentAtWallNs, sentAtMonoNs }` | Send MP_UNREACH UPDATEs |
 | `peer.waitForPrefixes(opts)` | `{ matched, missing, firstSeenWallNs, firstSeenMonoNs, lastSeenWallNs, lastSeenMonoNs }` | Block until all `opts.prefixes` are observed; throws on timeout |
+| `peer.stats()` | `{ updates, advertised, withdrawn, uniquePrefixes, firstUpdateWallNs, firstUpdateMonoNs, lastUpdateWallNs, lastUpdateMonoNs }` | Snapshot of cumulative receive-side counters; cheap, does not block |
 | `peer.close()` | — | Send Cease NOTIFICATION and close the session |
 
 ### Properties

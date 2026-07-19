@@ -77,6 +77,7 @@ func (mi *ModuleInstance) newPeer(call sobek.ConstructorCall) *sobek.Object {
 	bind("advertise", p.Advertise)
 	bind("withdraw", p.Withdraw)
 	bind("waitForPrefixes", p.WaitForPrefixes)
+	bind("stats", p.Stats)
 
 	// `state` is a read-only accessor property, not a method, so that
 	// `peer.state` returns the FSM state string (e.g. `'Established'`)
@@ -270,6 +271,22 @@ func (p *Peer) Open() (sobek.Value, error) {
 }
 
 func (p *Peer) Close() error { return p.impl.Close() }
+
+// Stats returns a snapshot of the receive-side counters accumulated
+// since Open. Cheap to call; does not block like waitForPrefixes.
+func (p *Peer) Stats() sobek.Value {
+	s := p.impl.Stats()
+	return p.mi.vu.Runtime().ToValue(map[string]any{
+		"updates":           s.Updates,
+		"advertised":        s.AdvertisedNLRI,
+		"withdrawn":         s.WithdrawnNLRI,
+		"uniquePrefixes":    s.UniquePrefixes,
+		"firstUpdateWallNs": s.FirstUpdateAt.WallNs(),
+		"firstUpdateMonoNs": s.FirstUpdateAt.MonoNs(),
+		"lastUpdateWallNs":  s.LastUpdateAt.WallNs(),
+		"lastUpdateMonoNs":  s.LastUpdateAt.MonoNs(),
+	})
+}
 
 func (p *Peer) Advertise(arg sobek.Value) (sobek.Value, error) {
 	rt := p.mi.vu.Runtime()
