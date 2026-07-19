@@ -56,7 +56,7 @@ var ErrAddPathNotNegotiated = errors.New("xk6-bgp: pathId requires the ADD-PATH 
 
 func (p *Peer) Advertise(req AdvertiseRequest) (AdvertiseResult, error) {
 	if p.fsm == nil || p.fsm.State() != StateEstablished {
-		return AdvertiseResult{}, ErrSessionNotReady
+		return AdvertiseResult{}, p.sessionNotReadyErr()
 	}
 	if len(req.Routes) == 0 {
 		return AdvertiseResult{}, errors.New("advertise: routes must be non-empty")
@@ -79,7 +79,7 @@ func (p *Peer) Advertise(req AdvertiseRequest) (AdvertiseResult, error) {
 
 func (p *Peer) Withdraw(req WithdrawRequest) (AdvertiseResult, error) {
 	if p.fsm == nil || p.fsm.State() != StateEstablished {
-		return AdvertiseResult{}, ErrSessionNotReady
+		return AdvertiseResult{}, p.sessionNotReadyErr()
 	}
 	if len(req.Routes) == 0 {
 		return AdvertiseResult{}, errors.New("withdraw: routes must be non-empty")

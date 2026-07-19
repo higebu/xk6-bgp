@@ -110,6 +110,20 @@ func (p *Peer) State() State {
 	return p.fsm.State()
 }
 
+// sessionNotReadyErr wraps ErrSessionNotReady with the async cause
+// (NOTIFICATION, hold timer expiry, read error) recorded by the FSM's
+// last fail, if any, so Advertise/Withdraw callers learn why the
+// session went down without a separate peer.state poll.
+func (p *Peer) sessionNotReadyErr() error {
+	if p.fsm == nil {
+		return ErrSessionNotReady
+	}
+	if cause := p.fsm.failureCause(); cause != nil {
+		return fmt.Errorf("%w: %w", ErrSessionNotReady, cause)
+	}
+	return ErrSessionNotReady
+}
+
 // SessionUpDuration returns the µs between OpenSent and Established, or
 // 0 if the session never reached Established.
 func (p *Peer) SessionUpDuration() int64 {

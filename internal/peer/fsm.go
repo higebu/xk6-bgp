@@ -103,18 +103,13 @@ type fsm struct {
 	openSentAt    timing.Timestamp
 	establishedAt timing.Timestamp
 
-	establishedCh chan struct{}
-	doneCh        chan error
-
 	observed *observedSet
 }
 
 func newFSM(cfg Config) *fsm {
 	f := &fsm{
-		cfg:           cfg,
-		establishedCh: make(chan struct{}),
-		doneCh:        make(chan error, 1),
-		observed:      newObservedSet(),
+		cfg:      cfg,
+		observed: newObservedSet(),
 	}
 	f.state.Store(int32(StateIdle))
 	return f
@@ -249,7 +244,6 @@ func (f *fsm) handshake(parent context.Context, deadline time.Time) error {
 		if gotPeerOpen && gotPeerKA {
 			f.establishedAt = timing.Now()
 			f.setState(StateEstablished)
-			close(f.establishedCh)
 			return nil
 		}
 
@@ -450,10 +444,6 @@ func (f *fsm) Close() error {
 		_ = f.conn.Close()
 	}
 	f.loopWg.Wait()
-	select {
-	case f.doneCh <- nil:
-	default:
-	}
 	return nil
 }
 
@@ -469,11 +459,14 @@ func (f *fsm) fail(err error) {
 	// UPDATEs can arrive, so letting them run out their timeout would
 	// just stall the VU.
 	f.observed.fail(err)
-	select {
-	case f.doneCh <- err:
-	default:
-	}
 }
 
 func (f *fsm) EstablishedAt() timing.Timestamp { return f.establishedAt }
 func (f *fsm) OpenSentAt() timing.Timestamp    { return f.openSentAt }
+
+// failureCause returns the async session-fatal error recorded by the
+// most recent fail() call (NOTIFICATION, hold timer expiry, read
+// error), or nil if the session has not failed. Lets Advertise/Withdraw
+// report why a session dropped between calls without the caller having
+// to separately poll peer.state.
+func (f *fsm) failureCause() error { return f.observed.failureCause() }

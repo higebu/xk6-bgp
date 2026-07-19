@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -325,6 +326,12 @@ func TestFSM_PeerDisconnectAfterEstablished(t *testing.T) {
 	})
 	if !errors.Is(err, ErrSessionNotReady) {
 		t.Fatalf("Advertise after peer FIN returned %v, want ErrSessionNotReady", err)
+	}
+	// The async fail() cause (a read error from the closed conn) must
+	// still be reachable so a VU calling Advertise after the session
+	// dropped learns why without a separate peer.state poll.
+	if !strings.Contains(err.Error(), "xk6-bgp: read:") {
+		t.Fatalf("Advertise error %v missing failure cause", err)
 	}
 }
 

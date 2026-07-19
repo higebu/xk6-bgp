@@ -198,6 +198,14 @@ func (o *observedSet) fail(err error) {
 	o.mu.Unlock()
 }
 
+// failureCause returns the error recorded by fail, or nil if the
+// session has not failed.
+func (o *observedSet) failureCause() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.failedErr
+}
+
 func (o *observedSet) deregisterWaiter(w *waiter) {
 	o.mu.Lock()
 	for i, x := range o.waiters {
