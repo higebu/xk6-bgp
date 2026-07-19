@@ -66,6 +66,76 @@ jobs:
             2>&1 | tee /tmp/k6-ipv6.log
           grep -q 'matched=200' /tmp/k6-ipv6.log
 
+      - name: smoke mup
+        run: |
+          set -euo pipefail
+          /tmp/fakebgpd -listen 127.0.0.1:11790 -families ipv4-mup -reflect &
+          FAKEBGPD_PID=$!
+          trap 'kill $FAKEBGPD_PID 2>/dev/null || true' EXIT
+          sleep 0.5
+          ./k6 run \
+            -e TARGET=127.0.0.1:11790 \
+            examples/mup.js \
+            2>&1 | tee /tmp/k6-mup.log
+          grep -q 'matched=4' /tmp/k6-mup.log
+
+      - name: smoke evpn
+        run: |
+          set -euo pipefail
+          /tmp/fakebgpd -listen 127.0.0.1:11790 -families l2vpn-evpn -reflect &
+          FAKEBGPD_PID=$!
+          trap 'kill $FAKEBGPD_PID 2>/dev/null || true' EXIT
+          sleep 0.5
+          ./k6 run \
+            -e TARGET=127.0.0.1:11790 \
+            examples/evpn.js \
+            2>&1 | tee /tmp/k6-evpn.log
+          grep -q 'matched=3' /tmp/k6-evpn.log
+
+      - name: smoke srv6-l3vpn
+        run: |
+          set -euo pipefail
+          /tmp/fakebgpd -listen 127.0.0.1:11790 -families l3vpn-ipv4-unicast -reflect &
+          FAKEBGPD_PID=$!
+          trap 'kill $FAKEBGPD_PID 2>/dev/null || true' EXIT
+          sleep 0.5
+          ./k6 run \
+            -e TARGET=127.0.0.1:11790 \
+            -e COUNT=200 \
+            examples/srv6_l3vpn.js \
+            2>&1 | tee /tmp/k6-srv6-l3vpn.log
+          grep -q 'matched=200' /tmp/k6-srv6-l3vpn.log
+
+      - name: smoke ipv4-addpath
+        run: |
+          set -euo pipefail
+          /tmp/fakebgpd -listen 127.0.0.1:11790 -families ipv4-unicast -reflect -addpath &
+          FAKEBGPD_PID=$!
+          trap 'kill $FAKEBGPD_PID 2>/dev/null || true' EXIT
+          sleep 0.5
+          ./k6 run \
+            -e TARGET=127.0.0.1:11790 \
+            -e COUNT=100 \
+            -e PATHS=2 \
+            examples/ipv4_addpath.js \
+            2>&1 | tee /tmp/k6-ipv4-addpath.log
+          grep -q 'matched=200' /tmp/k6-ipv4-addpath.log
+
+      - name: smoke multi-peer
+        run: |
+          set -euo pipefail
+          /tmp/fakebgpd -listen 127.0.0.1:11790 -families ipv4-unicast -reflect &
+          FAKEBGPD_PID=$!
+          trap 'kill $FAKEBGPD_PID 2>/dev/null || true' EXIT
+          sleep 0.5
+          ./k6 run \
+            -e TARGET=127.0.0.1:11790 \
+            -e NUM_PEERS=2 \
+            -e COUNT_PER_PEER=50 \
+            examples/multi_peer.js \
+            2>&1 | tee /tmp/k6-multi-peer.log
+          [ "$(grep -c 'matched=50' /tmp/k6-multi-peer.log)" -eq 2 ]
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest
