@@ -632,6 +632,126 @@ func TestDispatch_KnownBytes_EVPNIPPrefix(t *testing.T) {
 	}
 }
 
+// TestDispatch_KnownBytes_MUPInterworkSegmentDiscovery decodes a
+// byte-literal draft-mpmz-bess-mup-safi-03 section 3.1.1 UPDATE
+// carrying a MUP ISD route: RD 65000:1, prefix 10.10.10.0/24.
+func TestDispatch_KnownBytes_MUPInterworkSegmentDiscovery(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x40, // length 64
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x29, // total path attribute length 41
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 4-octet AS
+		0x80, 0x0e, 0x19, // MP_REACH_NLRI, length 25
+		0x00, 0x01, 0x55, // AFI 1 (IPv4) / SAFI 85 (MUP)
+		0x04,                   // next-hop length 4
+		0x0a, 0x00, 0x00, 0x01, // next-hop 10.0.0.1
+		0x00,                   // reserved
+		0x01, 0x00, 0x01, 0x0c, // MUP NLRI: arch type 1 (3GPP-5G), route type 1 (ISD), length 12
+		0x00, 0x00, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x01, // RD type 0, 65000:1
+		0x18,             // prefix length 24
+		0x0a, 0x0a, 0x0a, // prefix 10.10.10.0/24
+	)
+	o := dispatchRaw(t, raw)
+	want := "[type:isd][rd:65000:1][prefix:10.10.10.0/24]"
+	if _, ok := o.firstSeen[want]; !ok {
+		t.Errorf("MUP ISD route not observed under %q; got %v", want, mapKeys(o.firstSeen))
+	}
+}
+
+// TestDispatch_KnownBytes_MUPDirectSegmentDiscovery decodes a
+// byte-literal draft-mpmz-bess-mup-safi-03 section 3.1.2 UPDATE
+// carrying a MUP DSD route: RD 65000:1, address 10.10.10.1.
+func TestDispatch_KnownBytes_MUPDirectSegmentDiscovery(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x40, // length 64
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x29, // total path attribute length 41
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 4-octet AS
+		0x80, 0x0e, 0x19, // MP_REACH_NLRI, length 25
+		0x00, 0x01, 0x55, // AFI 1 (IPv4) / SAFI 85 (MUP)
+		0x04,                   // next-hop length 4
+		0x0a, 0x00, 0x00, 0x01, // next-hop 10.0.0.1
+		0x00,                   // reserved
+		0x01, 0x00, 0x02, 0x0c, // MUP NLRI: arch type 1 (3GPP-5G), route type 2 (DSD), length 12
+		0x00, 0x00, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x01, // RD type 0, 65000:1
+		0x0a, 0x0a, 0x0a, 0x01, // address 10.10.10.1
+	)
+	o := dispatchRaw(t, raw)
+	want := "[type:dsd][rd:65000:1][prefix:10.10.10.1]"
+	if _, ok := o.firstSeen[want]; !ok {
+		t.Errorf("MUP DSD route not observed under %q; got %v", want, mapKeys(o.firstSeen))
+	}
+}
+
+// TestDispatch_KnownBytes_MUPType1SessionTransformed decodes a
+// byte-literal draft-mpmz-bess-mup-safi-03 section 3.1.3 UPDATE
+// carrying a MUP T1ST route: RD 65000:1, prefix 192.0.2.0/24, TEID
+// 0.0.0.100, QFI 9, endpoint 10.10.10.1, no source address.
+func TestDispatch_KnownBytes_MUPType1SessionTransformed(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x4b, // length 75
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x34, // total path attribute length 52
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 4-octet AS
+		0x80, 0x0e, 0x24, // MP_REACH_NLRI, length 36
+		0x00, 0x01, 0x55, // AFI 1 (IPv4) / SAFI 85 (MUP)
+		0x04,                   // next-hop length 4
+		0x0a, 0x00, 0x00, 0x01, // next-hop 10.0.0.1
+		0x00,                   // reserved
+		0x01, 0x00, 0x03, 0x17, // MUP NLRI: arch type 1 (3GPP-5G), route type 3 (T1ST), length 23
+		0x00, 0x00, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x01, // RD type 0, 65000:1
+		0x18,             // prefix length 24
+		0xc0, 0x00, 0x02, // prefix 192.0.2.0/24
+		0x00, 0x00, 0x00, 0x64, // TEID 0.0.0.100
+		0x09,                   // QFI 9
+		0x20,                   // endpoint address length 32
+		0x0a, 0x0a, 0x0a, 0x01, // endpoint 10.10.10.1
+		0x00, // source address length 0 (no source)
+	)
+	o := dispatchRaw(t, raw)
+	want := "[type:t1st][rd:65000:1][prefix:192.0.2.0/24]"
+	if _, ok := o.firstSeen[want]; !ok {
+		t.Errorf("MUP T1ST route not observed under %q; got %v", want, mapKeys(o.firstSeen))
+	}
+}
+
+// TestDispatch_KnownBytes_MUPType2SessionTransformed decodes a
+// byte-literal draft-mpmz-bess-mup-safi-03 section 3.1.4 UPDATE
+// carrying a MUP T2ST route: RD 65000:1, endpoint 10.10.10.1
+// (endpoint-address-length 64: 32-bit endpoint + 32-bit TEID), TEID
+// 0.0.0.100.
+func TestDispatch_KnownBytes_MUPType2SessionTransformed(t *testing.T) {
+	raw := append(marker(),
+		0x00, 0x45, // length 69
+		0x02,       // type UPDATE
+		0x00, 0x00, // withdrawn routes length 0
+		0x00, 0x2e, // total path attribute length 46
+		0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+		0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH SEQ{65001}, 4-octet AS
+		0x80, 0x0e, 0x1e, // MP_REACH_NLRI, length 30
+		0x00, 0x01, 0x55, // AFI 1 (IPv4) / SAFI 85 (MUP)
+		0x04,                   // next-hop length 4
+		0x0a, 0x00, 0x00, 0x01, // next-hop 10.0.0.1
+		0x00,                   // reserved
+		0x01, 0x00, 0x04, 0x11, // MUP NLRI: arch type 1 (3GPP-5G), route type 4 (T2ST), length 17
+		0x00, 0x00, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x01, // RD type 0, 65000:1
+		0x40,                   // endpoint address length 64
+		0x0a, 0x0a, 0x0a, 0x01, // endpoint 10.10.10.1
+		0x00, 0x00, 0x00, 0x64, // TEID 0.0.0.100
+	)
+	o := dispatchRaw(t, raw)
+	want := "[type:t2st][rd:65000:1][endpoint-address-length:64][endpoint:10.10.10.1][teid:0.0.0.100]"
+	if _, ok := o.firstSeen[want]; !ok {
+		t.Errorf("MUP T2ST route not observed under %q; got %v", want, mapKeys(o.firstSeen))
+	}
+}
+
 func mapKeys(m map[string]timing.Timestamp) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
