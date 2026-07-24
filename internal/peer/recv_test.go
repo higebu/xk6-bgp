@@ -759,3 +759,185 @@ func mapKeys(m map[string]timing.Timestamp) []string {
 	}
 	return out
 }
+
+// dispatchRefreshRaw feeds a hand-crafted wire-format ROUTE-REFRESH
+// through the same parse + dispatch path readLoop uses.
+func dispatchRefreshRaw(t *testing.T, raw []byte, enhanced bool) *observedSet {
+	t.Helper()
+	msg, err := bgp.ParseBGPMessage(raw)
+	if err != nil {
+		t.Fatalf("ParseBGPMessage: %v", err)
+	}
+	rr, ok := msg.Body.(*bgp.BGPRouteRefresh)
+	if !ok {
+		t.Fatalf("parsed %T, want *bgp.BGPRouteRefresh", msg.Body)
+	}
+	f := &fsm{observed: newObservedSet(), enhancedRefreshNegotiated: enhanced}
+	f.dispatchRouteRefresh(rr, timing.Now())
+	return f.observed
+}
+
+// routeRefreshRaw is a byte-literal RFC 2918 ROUTE-REFRESH for
+// IPv4-unicast with the given demarcation subtype (RFC 7313 section 3).
+func routeRefreshRaw(demarcation byte) []byte {
+	return append(marker(),
+		0x00, 0x17, // length 23
+		0x05,       // type ROUTE-REFRESH
+		0x00, 0x01, // AFI 1 (IPv4)
+		demarcation,
+		0x01, // SAFI 1 (unicast)
+	)
+}
+
+func TestDispatch_KnownBytes_RouteRefreshRequest(t *testing.T) {
+	o := dispatchRefreshRaw(t, routeRefreshRaw(0x00), true)
+	if o.routeRefreshN != 1 || o.borrN != 0 || o.eorrN != 0 {
+		t.Fatalf("counters = %d/%d/%d, want 1/0/0", o.routeRefreshN, o.borrN, o.eorrN)
+	}
+}
+
+func TestDispatch_KnownBytes_BoRR(t *testing.T) {
+	o := dispatchRefreshRaw(t, routeRefreshRaw(0x01), true)
+	if o.borrN != 1 || o.routeRefreshN != 0 || o.eorrN != 0 {
+		t.Fatalf("counters = %d/%d/%d, want rr=0 borr=1 eorr=0", o.routeRefreshN, o.borrN, o.eorrN)
+	}
+}
+
+func TestDispatch_KnownBytes_EoRR(t *testing.T) {
+	o := dispatchRefreshRaw(t, routeRefreshRaw(0x02), true)
+	if o.eorrN != 1 || o.routeRefreshN != 0 || o.borrN != 0 {
+		t.Fatalf("counters = %d/%d/%d, want rr=0 borr=0 eorr=1", o.routeRefreshN, o.borrN, o.eorrN)
+	}
+	if _, ok := o.lastEoRR[bgp.RF_IPv4_UC]; !ok {
+		t.Fatal("EoRR timestamp not recorded for ipv4-unicast")
+	}
+}
+
+// TestDispatch_BoRRWithoutEnhancedNegotiation covers RFC 7313 section
+// 5: without the Enhanced Route Refresh capability negotiated, the
+// subtype field is Reserved (RFC 2918) and the message counts as a
+// plain refresh request.
+func TestDispatch_BoRRWithoutEnhancedNegotiation(t *testing.T) {
+	o := dispatchRefreshRaw(t, routeRefreshRaw(0x01), false)
+	if o.routeRefreshN != 1 || o.borrN != 0 || o.eorrN != 0 {
+		t.Fatalf("counters = %d/%d/%d, want 1/0/0", o.routeRefreshN, o.borrN, o.eorrN)
+	}
+}
+
+func refreshTestPeer(t *testing.T) *Peer {
+	t.Helper()
+	cfg := Config{
+		LocalAS:  65001,
+		Target:   "127.0.0.1:0",
+		RouterID: netip.MustParseAddr("10.0.0.1"),
+		Families: []bgp.Family{bgp.RF_IPv4_UC},
+	}
+	cfg.ApplyDefaults()
+	p := &Peer{cfg: cfg, fsm: newFSM(cfg)}
+	p.fsm.state.Store(int32(StateEstablished))
+	p.fsm.enhancedRefreshNegotiated = true
+	return p
+}
+
+func TestWaitForRouteRefreshEnd_Synchronous(t *testing.T) {
+	p := refreshTestPeer(t)
+	o := p.fsm.observed
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		o.applyRouteRefresh(bgp.RF_IPv4_UC, RouteRefreshEoRR, true, timing.Now())
+	}()
+
+	ts, err := p.WaitForRouteRefreshEnd(bgp.RF_IPv4_UC, 2*time.Second, timing.Timestamp{})
+	if err != nil {
+		t.Fatalf("WaitForRouteRefreshEnd: %v", err)
+	}
+	if ts.Time().IsZero() {
+		t.Fatal("EoRR timestamp is zero")
+	}
+}
+
+func TestWaitForRouteRefreshEnd_AlreadySeen(t *testing.T) {
+	p := refreshTestPeer(t)
+	p.fsm.observed.applyRouteRefresh(bgp.RF_IPv4_UC, RouteRefreshEoRR, true, timing.Now())
+
+	ts, err := p.WaitForRouteRefreshEnd(bgp.RF_IPv4_UC, 100*time.Millisecond, timing.Timestamp{})
+	if err != nil {
+		t.Fatalf("WaitForRouteRefreshEnd: %v", err)
+	}
+	if ts.Time().IsZero() {
+		t.Fatal("EoRR timestamp is zero")
+	}
+}
+
+// TestWaitForRouteRefreshEnd_OnlyAfter verifies an EoRR from an earlier
+// refresh cycle does not satisfy a waiter anchored after it.
+func TestWaitForRouteRefreshEnd_OnlyAfter(t *testing.T) {
+	p := refreshTestPeer(t)
+	o := p.fsm.observed
+
+	o.applyRouteRefresh(bgp.RF_IPv4_UC, RouteRefreshEoRR, true, timing.Now())
+	cutoff := timing.Now()
+
+	_, err := p.WaitForRouteRefreshEnd(bgp.RF_IPv4_UC, 100*time.Millisecond, cutoff)
+	if err == nil {
+		t.Fatal("expected timeout for stale EoRR")
+	}
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		o.applyRouteRefresh(bgp.RF_IPv4_UC, RouteRefreshEoRR, true, timing.Now())
+	}()
+	ts, err := p.WaitForRouteRefreshEnd(bgp.RF_IPv4_UC, 2*time.Second, cutoff)
+	if err != nil {
+		t.Fatalf("WaitForRouteRefreshEnd after fresh EoRR: %v", err)
+	}
+	if ts.Time().Before(cutoff.Time()) {
+		t.Fatal("returned EoRR predates the cutoff")
+	}
+}
+
+func TestWaitForRouteRefreshEnd_WrongFamilyDoesNotMatch(t *testing.T) {
+	p := refreshTestPeer(t)
+	p.fsm.observed.applyRouteRefresh(bgp.RF_IPv6_UC, RouteRefreshEoRR, true, timing.Now())
+
+	_, err := p.WaitForRouteRefreshEnd(bgp.RF_IPv4_UC, 100*time.Millisecond, timing.Timestamp{})
+	if err == nil {
+		t.Fatal("expected timeout: EoRR was for a different family")
+	}
+}
+
+func TestWaitForRouteRefreshEnd_RequiresEnhancedNegotiation(t *testing.T) {
+	p := refreshTestPeer(t)
+	p.fsm.enhancedRefreshNegotiated = false
+
+	_, err := p.WaitForRouteRefreshEnd(bgp.RF_IPv4_UC, 100*time.Millisecond, timing.Timestamp{})
+	if !errors.Is(err, ErrEnhancedRefreshNotNegotiated) {
+		t.Fatalf("got err=%v, want ErrEnhancedRefreshNotNegotiated", err)
+	}
+}
+
+// TestWaitForRouteRefreshEnd_SessionFailureWakesWaiter mirrors the
+// prefix-waiter discipline: a session-fatal error must release the
+// blocked waiter immediately instead of running out the timeout.
+func TestWaitForRouteRefreshEnd_SessionFailureWakesWaiter(t *testing.T) {
+	p := refreshTestPeer(t)
+	o := p.fsm.observed
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		o.fail(errors.New("test: session torn down"))
+	}()
+
+	start := time.Now()
+	_, err := p.WaitForRouteRefreshEnd(bgp.RF_IPv4_UC, 10*time.Second, timing.Timestamp{})
+	if err == nil {
+		t.Fatal("expected session-down error")
+	}
+	if !strings.Contains(err.Error(), "session down") {
+		t.Fatalf("err=%v, want session-down error", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waiter released after %s, want immediate wake", elapsed)
+	}
+}

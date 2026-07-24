@@ -36,6 +36,33 @@ type observedSet struct {
 	firstUpdate  timing.Timestamp
 
 	waiters []*waiter
+
+	// Inbound ROUTE-REFRESH accounting. routeRefreshN counts refresh
+	// requests (demarcation 0, or any subtype when RFC 7313 was not
+	// negotiated); borrN / eorrN count the RFC 7313 demarcations.
+	routeRefreshN uint64
+	borrN         uint64
+	eorrN         uint64
+	lastEoRR      map[bgp.Family]timing.Timestamp
+
+	refreshWaiters []*refreshWaiter
+}
+
+// refreshWaiter is what a single WaitForRouteRefreshEnd call holds
+// while blocked on an EoRR for family. Only an EoRR read at or after
+// the `after` cutoff (the refresh write timestamp) satisfies it, so an
+// EoRR left over from a previous refresh cycle does not match.
+type refreshWaiter struct {
+	family bgp.Family
+	after  time.Time
+	ts     timing.Timestamp
+
+	done     chan struct{}
+	doneOnce sync.Once
+}
+
+func (w *refreshWaiter) markDone() {
+	w.doneOnce.Do(func() { close(w.done) })
 }
 
 // waiter is what a single WaitForPrefixes call holds while blocked.
@@ -63,7 +90,71 @@ func newObservedSet() *observedSet {
 	return &observedSet{
 		firstSeen: make(map[string]timing.Timestamp, 1024),
 		withdrawn: make(map[string]struct{}),
+		lastEoRR:  make(map[bgp.Family]timing.Timestamp),
 	}
+}
+
+// applyRouteRefresh records one inbound ROUTE-REFRESH. enhanced selects
+// whether the demarcation subtype is honored: without RFC 7313
+// negotiated the whole message counts as a plain refresh request per
+// RFC 7313 section 5.
+func (o *observedSet) applyRouteRefresh(fam bgp.Family, demarcation uint8, enhanced bool, ts timing.Timestamp) {
+	o.mu.Lock()
+	if !enhanced {
+		o.routeRefreshN++
+		o.mu.Unlock()
+		return
+	}
+	switch demarcation {
+	case RouteRefreshBoRR:
+		o.borrN++
+	case RouteRefreshEoRR:
+		o.eorrN++
+		o.lastEoRR[fam] = ts
+		for _, w := range o.refreshWaiters {
+			if w.family != fam {
+				continue
+			}
+			if !w.after.IsZero() && ts.Time().Before(w.after) {
+				continue
+			}
+			w.ts = ts
+			w.markDone()
+		}
+	default:
+		o.routeRefreshN++
+	}
+	o.mu.Unlock()
+}
+
+func (o *observedSet) registerRefreshWaiter(fam bgp.Family, after timing.Timestamp) *refreshWaiter {
+	w := &refreshWaiter{
+		family: fam,
+		after:  after.Time(),
+		done:   make(chan struct{}),
+	}
+	o.mu.Lock()
+	if ts, ok := o.lastEoRR[fam]; ok && (w.after.IsZero() || !ts.Time().Before(w.after)) {
+		w.ts = ts
+		w.markDone()
+	} else if o.failedErr != nil {
+		w.markDone()
+	} else {
+		o.refreshWaiters = append(o.refreshWaiters, w)
+	}
+	o.mu.Unlock()
+	return w
+}
+
+func (o *observedSet) deregisterRefreshWaiter(w *refreshWaiter) {
+	o.mu.Lock()
+	for i, x := range o.refreshWaiters {
+		if x == w {
+			o.refreshWaiters = append(o.refreshWaiters[:i], o.refreshWaiters[i+1:]...)
+			break
+		}
+	}
+	o.mu.Unlock()
 }
 
 // applyUpdate records reach/unreach NLRI. With ADD-PATH receive
@@ -205,6 +296,9 @@ func (o *observedSet) fail(err error) {
 	for _, w := range o.waiters {
 		w.markDone()
 	}
+	for _, w := range o.refreshWaiters {
+		w.markDone()
+	}
 	o.mu.Unlock()
 }
 
@@ -296,6 +390,9 @@ type Stats struct {
 	UniquePrefixes int
 	FirstUpdateAt  timing.Timestamp
 	LastUpdateAt   timing.Timestamp
+	RouteRefreshes uint64
+	BoRRs          uint64
+	EoRRs          uint64
 }
 
 func (p *Peer) Stats() Stats {
@@ -312,7 +409,56 @@ func (p *Peer) Stats() Stats {
 		UniquePrefixes: len(o.firstSeen),
 		FirstUpdateAt:  o.firstUpdate,
 		LastUpdateAt:   o.lastUpdateAt,
+		RouteRefreshes: o.routeRefreshN,
+		BoRRs:          o.borrN,
+		EoRRs:          o.eorrN,
 	}
+}
+
+// ErrEnhancedRefreshNotNegotiated is returned by WaitForRouteRefreshEnd
+// when RFC 7313 Enhanced Route Refresh was not negotiated — the peer
+// will never send an EoRR, so there is nothing to wait for. Scripts on
+// an RFC 2918-only session compose RouteRefresh with WaitForPrefixes
+// instead.
+var ErrEnhancedRefreshNotNegotiated = errors.New("xk6-bgp: waitForRouteRefreshEnd requires the RFC 7313 Enhanced Route Refresh capability to be negotiated by both sides")
+
+// WaitForRouteRefreshEnd blocks until the peer's EoRR demarcation for
+// family is read, or timeout elapses. If onlyAfter is non-zero, an EoRR
+// read before it (e.g. from an earlier refresh cycle on the same
+// session) does not count. Returns the EoRR read timestamp — together
+// with the RouteRefresh write timestamp this is the input to
+// bgp_route_refresh_duration.
+func (p *Peer) WaitForRouteRefreshEnd(family bgp.Family, timeout time.Duration, onlyAfter timing.Timestamp) (timing.Timestamp, error) {
+	if p.fsm == nil || p.fsm.State() != StateEstablished {
+		return timing.Timestamp{}, p.sessionNotReadyErr()
+	}
+	if !p.fsm.enhancedRefreshNegotiated {
+		return timing.Timestamp{}, ErrEnhancedRefreshNotNegotiated
+	}
+
+	o := p.fsm.observed
+	w := o.registerRefreshWaiter(family, onlyAfter)
+	defer o.deregisterRefreshWaiter(w)
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-w.done:
+	case <-timer.C:
+	}
+
+	o.mu.Lock()
+	ts := w.ts
+	failed := o.failedErr
+	o.mu.Unlock()
+
+	if ts.Time().IsZero() {
+		if failed != nil {
+			return timing.Timestamp{}, fmt.Errorf("waitForRouteRefreshEnd: session down (%w)", failed)
+		}
+		return timing.Timestamp{}, fmt.Errorf("waitForRouteRefreshEnd: timed out after %s waiting for EoRR (%s)", timeout, family)
+	}
+	return ts, nil
 }
 
 // dispatchUpdate is called by readLoop on every UPDATE. MP_REACH and
@@ -339,4 +485,13 @@ func (f *fsm) dispatchUpdate(u *bgp.BGPUpdate, ts timing.Timestamp) {
 // fam, i.e. whether inbound NLRI for fam carry Path Identifiers.
 func (f *fsm) addPathReceive(fam bgp.Family) bool {
 	return f.addPathNegotiated[fam]&bgp.BGP_ADD_PATH_RECEIVE != 0
+}
+
+// dispatchRouteRefresh is called by readLoop on every ROUTE-REFRESH.
+// Replaying our advertisements in response is deliberately not done —
+// the test script stays in control of what is sent; the message is
+// only accounted so scripts can observe DUT-solicited refreshes.
+func (f *fsm) dispatchRouteRefresh(m *bgp.BGPRouteRefresh, ts timing.Timestamp) {
+	fam := bgp.NewFamily(m.AFI, m.SAFI)
+	f.observed.applyRouteRefresh(fam, m.Demarcation, f.enhancedRefreshNegotiated, ts)
 }

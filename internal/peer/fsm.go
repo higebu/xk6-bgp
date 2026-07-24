@@ -423,6 +423,8 @@ func (f *fsm) readLoop() {
 		switch m := msg.Body.(type) {
 		case *bgp.BGPUpdate:
 			f.dispatchUpdate(m, ts)
+		case *bgp.BGPRouteRefresh:
+			f.dispatchRouteRefresh(m, ts)
 		case *bgp.BGPKeepAlive:
 		case *bgp.BGPNotification:
 			f.fail(fmt.Errorf("%w: code=%d sub=%d", ErrPeerRejected, m.ErrorCode, m.ErrorSubcode))
