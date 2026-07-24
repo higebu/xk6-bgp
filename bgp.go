@@ -77,6 +77,8 @@ func (mi *ModuleInstance) newPeer(call sobek.ConstructorCall) *sobek.Object {
 	bind("advertise", p.Advertise)
 	bind("withdraw", p.Withdraw)
 	bind("waitForPrefixes", p.WaitForPrefixes)
+	bind("routeRefresh", p.RouteRefresh)
+	bind("waitForRouteRefreshEnd", p.WaitForRouteRefreshEnd)
 	bind("stats", p.Stats)
 
 	// `state` is a read-only accessor property, not a method, so that
@@ -271,14 +273,17 @@ func (p *Peer) Close() error { return p.impl.Close() }
 func (p *Peer) Stats() sobek.Value {
 	s := p.impl.Stats()
 	return p.mi.vu.Runtime().ToValue(map[string]any{
-		"updates":           s.Updates,
-		"advertised":        s.AdvertisedNLRI,
-		"withdrawn":         s.WithdrawnNLRI,
-		"uniquePrefixes":    s.UniquePrefixes,
-		"firstUpdateWallNs": s.FirstUpdateAt.WallNs(),
-		"firstUpdateMonoNs": s.FirstUpdateAt.MonoNs(),
-		"lastUpdateWallNs":  s.LastUpdateAt.WallNs(),
-		"lastUpdateMonoNs":  s.LastUpdateAt.MonoNs(),
+		"updates":              s.Updates,
+		"advertised":           s.AdvertisedNLRI,
+		"withdrawn":            s.WithdrawnNLRI,
+		"uniquePrefixes":       s.UniquePrefixes,
+		"firstUpdateWallNs":    s.FirstUpdateAt.WallNs(),
+		"firstUpdateMonoNs":    s.FirstUpdateAt.MonoNs(),
+		"lastUpdateWallNs":     s.LastUpdateAt.WallNs(),
+		"lastUpdateMonoNs":     s.LastUpdateAt.MonoNs(),
+		"routeRefreshReceived": s.RouteRefreshes,
+		"borrReceived":         s.BoRRs,
+		"eorrReceived":         s.EoRRs,
 	})
 }
 
@@ -381,6 +386,105 @@ func (p *Peer) WaitForPrefixes(arg sobek.Value) (sobek.Value, error) {
 			p.mi.metrics.PrefixReceived, p.tags, float64(res.Matched))
 	}
 	return out, nil
+}
+
+// RouteRefresh sends one RFC 2918 ROUTE-REFRESH request for the family
+// and returns the write timestamp. Requires the peer to have advertised
+// the Route Refresh capability in its OPEN.
+//
+// JS shape:
+//
+//	const rr = peer.routeRefresh({ family: 'ipv4-unicast' })
+//	// { sentAtWallNs, sentAtMonoNs }
+func (p *Peer) RouteRefresh(arg sobek.Value) (sobek.Value, error) {
+	rt := p.mi.vu.Runtime()
+	fam, err := p.refreshFamilyArg(rt, arg, "routeRefresh")
+	if err != nil {
+		return nil, err
+	}
+	ts, err := p.impl.RouteRefresh(fam)
+	if err != nil {
+		return nil, err
+	}
+	return rt.ToValue(map[string]any{
+		"sentAtWallNs": ts.WallNs(),
+		"sentAtMonoNs": ts.MonoNs(),
+	}), nil
+}
+
+// WaitForRouteRefreshEnd blocks until the RFC 7313 EoRR demarcation for
+// the family arrives or the timeout expires. sentAtMonoNs, when
+// provided, (a) anchors bgp_route_refresh_duration and (b) filters an
+// EoRR left over from an earlier refresh cycle on the same session.
+// Requires Enhanced Route Refresh to be negotiated; on an RFC 2918-only
+// session compose routeRefresh() with waitForPrefixes({sentAtMonoNs})
+// instead.
+//
+// JS shape:
+//
+//	const rr = peer.routeRefresh({ family: 'ipv4-unicast' })
+//	peer.waitForRouteRefreshEnd({
+//	  family:       'ipv4-unicast',
+//	  timeout:      '10s',
+//	  sentAtMonoNs: rr.sentAtMonoNs,
+//	})
+func (p *Peer) WaitForRouteRefreshEnd(arg sobek.Value) (sobek.Value, error) {
+	rt := p.mi.vu.Runtime()
+	fam, err := p.refreshFamilyArg(rt, arg, "waitForRouteRefreshEnd")
+	if err != nil {
+		return nil, err
+	}
+	obj := arg.ToObject(rt)
+	timeout, err := optDuration(obj, "timeout")
+	if err != nil {
+		return nil, fmt.Errorf("waitForRouteRefreshEnd.timeout: %w", err)
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	sentMono := optInt64(obj, "sentAtMonoNs")
+	var onlyAfter timing.Timestamp
+	if sentMono > 0 {
+		onlyAfter = timing.FromMonoNs(sentMono)
+	}
+
+	ts, err := p.impl.WaitForRouteRefreshEnd(fam, timeout, onlyAfter)
+	if err != nil {
+		return nil, err
+	}
+	if p.mi.metrics != nil && p.tags != nil && sentMono > 0 {
+		us := (ts.MonoNs() - sentMono) / 1000
+		if us >= 0 {
+			xmetrics.PushTrendMicros(p.mi.vu.Context(), p.mi.vu.State().Samples,
+				p.mi.metrics.RouteRefreshDuration, p.tags, us)
+		}
+	}
+	return rt.ToValue(map[string]any{
+		"eorrWallNs": ts.WallNs(),
+		"eorrMonoNs": ts.MonoNs(),
+	}), nil
+}
+
+// refreshFamilyArg extracts and resolves the `family` member shared by
+// routeRefresh and waitForRouteRefreshEnd, validating it against the
+// Peer's configured families like advertise does.
+func (p *Peer) refreshFamilyArg(rt *sobek.Runtime, arg sobek.Value, method string) (gobgp.Family, error) {
+	if common.IsNullish(arg) {
+		return 0, fmt.Errorf("%s: missing argument", method)
+	}
+	obj := arg.ToObject(rt)
+	if obj == nil {
+		return 0, fmt.Errorf("%s: argument must be an object", method)
+	}
+	famStr := optString(obj, "family")
+	if famStr == "" {
+		return 0, fmt.Errorf("%s: family is required", method)
+	}
+	fam, ok := p.families[famStr]
+	if !ok {
+		return 0, fmt.Errorf("%s: family %q was not advertised on this Peer", method, famStr)
+	}
+	return fam, nil
 }
 
 // parsePrefixList collects the user's prefix array and canonicalizes
