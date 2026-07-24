@@ -71,6 +71,105 @@ func TestAdvertise_RejectsPathIDWithoutNegotiation(t *testing.T) {
 	}
 }
 
+// TestRouteRefresh_RejectsWithoutNegotiation verifies the RFC 2918
+// section 4 guard: a ROUTE-REFRESH must not be sent to a peer that did
+// not advertise the Route Refresh capability.
+func TestRouteRefresh_RejectsWithoutNegotiation(t *testing.T) {
+	cfg := Config{
+		LocalAS:  65001,
+		Target:   "127.0.0.1:0",
+		RouterID: netip.MustParseAddr("10.0.0.1"),
+		Families: []bgp.Family{bgp.RF_IPv4_UC},
+	}
+	cfg.ApplyDefaults()
+	p := &Peer{cfg: cfg, fsm: newFSM(cfg)}
+	p.fsm.state.Store(int32(StateEstablished))
+
+	_, err := p.RouteRefresh(bgp.RF_IPv4_UC)
+	if !errors.Is(err, ErrRouteRefreshNotNegotiated) {
+		t.Fatalf("got err=%v, want ErrRouteRefreshNotNegotiated", err)
+	}
+}
+
+func TestRouteRefresh_RejectsBeforeEstablished(t *testing.T) {
+	cfg := Config{
+		LocalAS:  65001,
+		Target:   "127.0.0.1:0",
+		RouterID: netip.MustParseAddr("10.0.0.1"),
+		Families: []bgp.Family{bgp.RF_IPv4_UC},
+	}
+	cfg.ApplyDefaults()
+	p := &Peer{cfg: cfg, fsm: newFSM(cfg)}
+
+	_, err := p.RouteRefresh(bgp.RF_IPv4_UC)
+	if !errors.Is(err, ErrSessionNotReady) {
+		t.Fatalf("got err=%v, want ErrSessionNotReady", err)
+	}
+}
+
+// TestRouteRefresh_WireRoundTrip sends a refresh over a pipe and parses
+// the wire bytes back through gobgp ParseBGPMessage.
+func TestRouteRefresh_WireRoundTrip(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	cfg := Config{
+		LocalAS:  65001,
+		Target:   "127.0.0.1:0",
+		RouterID: netip.MustParseAddr("10.0.0.1"),
+		Families: []bgp.Family{bgp.RF_IPv6_UC},
+	}
+	cfg.ApplyDefaults()
+	p := &Peer{cfg: cfg, fsm: newFSM(cfg)}
+	p.fsm.conn = c1
+	p.fsm.state.Store(int32(StateEstablished))
+	p.fsm.routeRefreshNegotiated = true
+
+	type result struct {
+		rr  *bgp.BGPRouteRefresh
+		err error
+	}
+	gotCh := make(chan result, 1)
+	go func() {
+		_, msg, err := ReadMessage(c2)
+		if err != nil {
+			gotCh <- result{err: err}
+			return
+		}
+		rr, ok := msg.Body.(*bgp.BGPRouteRefresh)
+		if !ok {
+			gotCh <- result{err: fmt.Errorf("parsed %T, want *bgp.BGPRouteRefresh", msg.Body)}
+			return
+		}
+		gotCh <- result{rr: rr}
+	}()
+
+	ts, err := p.RouteRefresh(bgp.RF_IPv6_UC)
+	if err != nil {
+		t.Fatalf("RouteRefresh: %v", err)
+	}
+	if ts.Time().IsZero() {
+		t.Fatal("write timestamp is zero")
+	}
+
+	select {
+	case got := <-gotCh:
+		if got.err != nil {
+			t.Fatalf("reader: %v", got.err)
+		}
+		if got.rr.AFI != bgp.RF_IPv6_UC.Afi() || got.rr.SAFI != bgp.RF_IPv6_UC.Safi() {
+			t.Fatalf("AFI/SAFI = %d/%d, want %d/%d",
+				got.rr.AFI, got.rr.SAFI, bgp.RF_IPv6_UC.Afi(), bgp.RF_IPv6_UC.Safi())
+		}
+		if got.rr.Demarcation != RouteRefreshNormal {
+			t.Fatalf("demarcation = %d, want %d", got.rr.Demarcation, RouteRefreshNormal)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader did not finish in 2s")
+	}
+}
+
 // TestWriteUpdates_AddPath round-trips two paths for the same prefix
 // through writeUpdates on a session that negotiated ADD-PATH, reading
 // them back with the matching receive-side MarshallingOption.
