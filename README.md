@@ -84,6 +84,7 @@ various scenarios:
 - [`ipv4_addpath.js`](./examples/ipv4_addpath.js) — RFC 7911 ADD-PATH delivery of multiple paths per prefix
 - [`mup.js`](./examples/mup.js) — `ipv4-mup` advertise of all four MUP route types
 - [`srv6_l3vpn.js`](./examples/srv6_l3vpn.js) — `l3vpn-ipv4` advertise with RT + SRv6 L3 Service TLV (End.DT4 SID)
+- [`route_refresh.js`](./examples/route_refresh.js) — RFC 2918 ROUTE-REFRESH with RFC 7313 EoRR-demarcated replay measurement
 - [`throughput.js`](./examples/throughput.js) — single-peer advertise throughput sweep over `COUNT` prefixes
 - [`multi_peer.js`](./examples/multi_peer.js) — many-peer benchmark
 - [`session_up.js`](./examples/session_up.js) — `OPEN → Established` scaling under many concurrent peers
@@ -124,6 +125,11 @@ Negotiated by default in OPEN:
 
 Opt-in via `capabilities`:
 
+- Enhanced Route Refresh ([RFC 7313](https://www.rfc-editor.org/rfc/rfc7313.txt)) —
+  `enhancedRouteRefresh: true`. When both sides advertise it, inbound
+  BoRR/EoRR demarcations are recognized and
+  `peer.waitForRouteRefreshEnd` can measure a refresh replay end-to-end
+  (see [`docs/route_refresh.md`](./docs/route_refresh.md)).
 - ADD-PATH ([RFC 7911](https://www.rfc-editor.org/rfc/rfc7911.txt)) —
   `addPath: { '<family>': 'receive' | 'send' | 'both' }` per family.
   Each direction takes effect only when the peer advertised the
@@ -169,7 +175,9 @@ goroutine, so blocking in one VU does not block others.
 | `peer.advertise(opts)` | `{ count, sentAtWallNs, sentAtMonoNs }` | Send MP_REACH UPDATEs |
 | `peer.withdraw(opts)` | `{ count, sentAtWallNs, sentAtMonoNs }` | Send MP_UNREACH UPDATEs |
 | `peer.waitForPrefixes(opts)` | `{ matched, missing, firstSeenWallNs, firstSeenMonoNs, lastSeenWallNs, lastSeenMonoNs }` | Block until all `opts.prefixes` are observed; throws on timeout |
-| `peer.stats()` | `{ updates, advertised, withdrawn, uniquePrefixes, firstUpdateWallNs, firstUpdateMonoNs, lastUpdateWallNs, lastUpdateMonoNs }` | Snapshot of cumulative receive-side counters; cheap, does not block |
+| `peer.routeRefresh(opts)` | `{ sentAtWallNs, sentAtMonoNs }` | Send a ROUTE-REFRESH request ([RFC 2918](https://www.rfc-editor.org/rfc/rfc2918.txt)) for `opts.family`; errors unless the peer advertised the Route Refresh capability — see [`docs/route_refresh.md`](./docs/route_refresh.md) |
+| `peer.waitForRouteRefreshEnd(opts)` | `{ eorrWallNs, eorrMonoNs }` | Block until the peer's EoRR demarcation ([RFC 7313](https://www.rfc-editor.org/rfc/rfc7313.txt)) for `opts.family`; requires `enhancedRouteRefresh` negotiated. `opts.sentAtMonoNs` (typically `routeRefresh.sentAtMonoNs`) anchors `bgp_route_refresh_duration` and filters EoRRs from earlier refresh cycles; also takes `opts.timeout` |
+| `peer.stats()` | `{ updates, advertised, withdrawn, uniquePrefixes, firstUpdateWallNs, firstUpdateMonoNs, lastUpdateWallNs, lastUpdateMonoNs, routeRefreshReceived, borrReceived, eorrReceived }` | Snapshot of cumulative receive-side counters; cheap, does not block |
 | `peer.close()` | — | Send Cease NOTIFICATION and close the session |
 
 ### Properties
@@ -238,8 +246,9 @@ scenario's `maxDuration`. A timed-out arrival still counts toward
 | `bgp_prefix_received_duration` | Trend | µs | `sentAtMonoNs` → receive timestamp of the last expected prefix |
 | `bgp_prefix_sent` | Counter | routes | Cumulative NLRIs sent |
 | `bgp_prefix_received` | Counter | routes | Cumulative NLRIs received |
+| `bgp_route_refresh_duration` | Trend | µs | ROUTE-REFRESH write → EoRR read ([RFC 7313](https://www.rfc-editor.org/rfc/rfc7313.txt)); see [`docs/route_refresh.md`](./docs/route_refresh.md) |
 
-The two Trend metrics carry microsecond samples. They don't end in
+The Trend metrics carry microsecond samples. They don't end in
 `_us` (k6 convention is to document the unit in the metric table
 rather than embed it in the name). BGP delivery latencies are
 typically sub-millisecond, so storing them as ms would round many
@@ -250,10 +259,11 @@ can attach additional tags via the `tags` option on the Peer
 constructor.
 
 Under k6's Prometheus remote-write output, names are prefixed with
-`k6_` and Counters get a `_total` suffix appended, so the four
+`k6_` and Counters get a `_total` suffix appended, so the
 metrics above show up as `k6_bgp_session_up_*`,
-`k6_bgp_prefix_received_duration_*`, `k6_bgp_prefix_sent_total`,
-`k6_bgp_prefix_received_total` in Prometheus.
+`k6_bgp_prefix_received_duration_*`, `k6_bgp_route_refresh_duration_*`,
+`k6_bgp_prefix_sent_total`, `k6_bgp_prefix_received_total` in
+Prometheus.
 
 ## Build
 
