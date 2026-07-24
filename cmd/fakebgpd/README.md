@@ -3,8 +3,11 @@
 `fakebgpd` is a minimal BGP speaker bundled with xk6-bgp for end-to-end
 smoke tests. It is **not** a routing daemon: it accepts BGP sessions,
 completes the OPEN / KEEPALIVE handshake, optionally reflects every
-UPDATE it receives to all other connected sessions, and exits when
-either side tears the TCP connection down.
+UPDATE it receives to all other connected sessions, answers
+ROUTE-REFRESH requests by replaying the other sessions' cached UPDATEs
+(bracketed by RFC 7313 BoRR/EoRR when the client negotiated Enhanced
+Route Refresh), and exits when either side tears the TCP connection
+down.
 
 The delivery examples (`examples/ipv4_unicast.js`, `examples/ipv6_unicast.js`)
 use `fakebgpd -reflect` so the sender Peer and the receiver Peer can
@@ -50,9 +53,12 @@ round-trip through fakebgpd.
 ## Scope
 
 - No Loc-RIB, no best-path, no policy. Reflection is a literal byte-for-
-  byte re-send of the original UPDATE to every other session.
+  byte re-send of the original UPDATE to every other session, and
+  refresh replay re-sends the cached UPDATEs the same way (no per-family
+  filtering).
 - Capabilities advertised: MP-BGP (per `-families`), Route Refresh,
-  Extended Messages, 4-octet AS, and (with `-addpath`) ADD-PATH.
+  Enhanced Route Refresh, Extended Messages, 4-octet AS, and (with
+  `-addpath`) ADD-PATH.
 - Hold time is hard-coded to 90 s, keepalive period to 30 s.
 - Intended for local smoke and CI; not for any kind of performance
   measurement of the BGP code path itself.
