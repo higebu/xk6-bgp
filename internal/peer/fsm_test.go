@@ -543,6 +543,58 @@ func TestAcceptPeerOpen_AddPathNegotiation(t *testing.T) {
 	}
 }
 
+// TestAcceptPeerOpen_RouteRefreshNegotiation covers the RFC 2918 /
+// RFC 7313 capability flags: sending a refresh needs only the peer's
+// Route Refresh capability, while BoRR/EoRR demarcations need Enhanced
+// Route Refresh advertised by both sides (RFC 7313 section 4).
+func TestAcceptPeerOpen_RouteRefreshNegotiation(t *testing.T) {
+	cases := []struct {
+		name          string
+		localEnhanced bool
+		peerRR        bool
+		peerEnhanced  bool
+		wantRR        bool
+		wantEnhanced  bool
+	}{
+		{"peer-none", true, false, false, false, false},
+		{"peer-rr-only", true, true, false, true, false},
+		{"both-enhanced", true, true, true, true, true},
+		{"peer-enhanced-local-off", false, true, true, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				LocalAS:  65001,
+				PeerAS:   65000,
+				RouterID: netip.MustParseAddr("10.0.0.1"),
+				Target:   "127.0.0.1:0",
+				Families: []bgp.Family{bgp.RF_IPv4_UC},
+			}
+			cfg.Caps.EnhancedRefresh = tc.localEnhanced
+			cfg.ApplyDefaults()
+			f := newFSM(cfg)
+
+			peerCaps := []bgp.ParameterCapabilityInterface{bgp.NewCapFourOctetASNumber(65000)}
+			if tc.peerRR {
+				peerCaps = append(peerCaps, bgp.NewCapRouteRefresh())
+			}
+			if tc.peerEnhanced {
+				peerCaps = append(peerCaps, bgp.NewCapEnhancedRouteRefresh())
+			}
+			if err := f.acceptPeerOpen(makePeerOpen(t, peerCaps...)); err != nil {
+				t.Fatalf("acceptPeerOpen: %v", err)
+			}
+
+			if f.routeRefreshNegotiated != tc.wantRR {
+				t.Fatalf("routeRefreshNegotiated = %v, want %v", f.routeRefreshNegotiated, tc.wantRR)
+			}
+			if f.enhancedRefreshNegotiated != tc.wantEnhanced {
+				t.Fatalf("enhancedRefreshNegotiated = %v, want %v", f.enhancedRefreshNegotiated, tc.wantEnhanced)
+			}
+		})
+	}
+}
+
 // TestAcceptPeerOpen_TwoByteASPeer verifies a peer that does not
 // advertise the RFC 6793 4-octet AS capability flips the session to
 // 2-octet AS_PATH handling.
