@@ -25,6 +25,16 @@ import (
 type hub struct {
 	mu      sync.Mutex
 	clients map[*session]struct{}
+	// updates caches every raw UPDATE received, tagged with its origin
+	// session, so a ROUTE-REFRESH can be answered by replaying the
+	// other sessions' advertisements (a stand-in for a real daemon's
+	// Adj-RIB-Out walk). Unbounded, which is fine for a test daemon.
+	updates []cachedUpdate
+}
+
+type cachedUpdate struct {
+	from *session
+	raw  []byte
 }
 
 func (h *hub) add(s *session) {
@@ -37,6 +47,40 @@ func (h *hub) remove(s *session) {
 	h.mu.Lock()
 	delete(h.clients, s)
 	h.mu.Unlock()
+}
+
+func (h *hub) record(from *session, raw []byte) {
+	h.mu.Lock()
+	h.updates = append(h.updates, cachedUpdate{from: from, raw: raw})
+	h.mu.Unlock()
+}
+
+// replay answers a ROUTE-REFRESH from s: every cached UPDATE that s did
+// not originate is re-sent to s, bracketed by BoRR/EoRR demarcations
+// when s negotiated RFC 7313 Enhanced Route Refresh.
+func (h *hub) replay(s *session, fam bgp.Family, enhanced bool) {
+	h.mu.Lock()
+	raws := make([][]byte, 0, len(h.updates))
+	for _, u := range h.updates {
+		if u.from != s {
+			raws = append(raws, u.raw)
+		}
+	}
+	h.mu.Unlock()
+
+	if enhanced {
+		if b, err := xpeer.BuildRouteRefresh(fam, xpeer.RouteRefreshBoRR).Serialize(); err == nil {
+			s.writeRaw(b)
+		}
+	}
+	for _, raw := range raws {
+		s.writeRaw(raw)
+	}
+	if enhanced {
+		if b, err := xpeer.BuildRouteRefresh(fam, xpeer.RouteRefreshEoRR).Serialize(); err == nil {
+			s.writeRaw(b)
+		}
+	}
 }
 
 func (h *hub) broadcast(from *session, raw []byte) {
@@ -144,7 +188,11 @@ func handleConn(conn net.Conn, h *hub, myAS uint32, rid string, families []bgp.F
 		FourOctetAS:     myAS,
 		RouteRefresh:    true,
 		ExtendedMessage: true,
+		EnhancedRefresh: true,
 	}
+	// RFC 7313 section 4: BoRR/EoRR demarcations are in effect only when
+	// both sides advertised the Enhanced Route Refresh capability.
+	enhanced := hasCap(peerOpen, bgp.BGP_CAP_ENHANCED_ROUTE_REFRESH)
 	var rxOpts []*bgp.MarshallingOption
 	if addPath {
 		caps.AddPath = make(map[bgp.Family]bgp.BGPAddPathMode, len(families))
@@ -211,8 +259,15 @@ func handleConn(conn net.Conn, h *hub, myAS uint32, rid string, families []bgp.F
 		case *bgp.BGPUpdate:
 			updates++
 			describeUpdate(conn.RemoteAddr(), updates, m)
+			h.record(s, raw)
 			if reflectMode {
 				h.broadcast(s, raw)
+			}
+		case *bgp.BGPRouteRefresh:
+			log.Printf("%s: ROUTE-REFRESH afi=%d safi=%d demarcation=%d",
+				conn.RemoteAddr(), m.AFI, m.SAFI, m.Demarcation)
+			if m.Demarcation == xpeer.RouteRefreshNormal {
+				h.replay(s, bgp.NewFamily(m.AFI, m.SAFI), enhanced)
 			}
 		case *bgp.BGPKeepAlive:
 		case *bgp.BGPNotification:
@@ -220,6 +275,22 @@ func handleConn(conn net.Conn, h *hub, myAS uint32, rid string, families []bgp.F
 			return
 		}
 	}
+}
+
+// hasCap reports whether the peer's OPEN advertised the capability code.
+func hasCap(open *bgp.BGPOpen, code bgp.BGPCapabilityCode) bool {
+	for _, p := range open.OptParams {
+		ocp, ok := p.(*bgp.OptionParameterCapability)
+		if !ok {
+			continue
+		}
+		for _, c := range ocp.Capability {
+			if c.Code() == code {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // addPathReceiveModes returns the per-family decode option for a

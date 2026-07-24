@@ -85,6 +85,14 @@ type fsm struct {
 	peerCaps                   []bgp.ParameterCapabilityInterface
 	extendedMessagesNegotiated bool
 	fourOctetASNegotiated      bool
+	// routeRefreshNegotiated is set when the peer advertised the RFC
+	// 2918 Route Refresh capability (code 2). RFC 2918 section 4 allows
+	// sending a ROUTE-REFRESH only to a peer that advertised it.
+	routeRefreshNegotiated bool
+	// enhancedRefreshNegotiated is set when both sides advertised the
+	// RFC 7313 Enhanced Route Refresh capability (code 70); only then
+	// are inbound BoRR/EoRR demarcations recognized (RFC 7313 section 4).
+	enhancedRefreshNegotiated bool
 	// addPathNegotiated is the effective per-family RFC 7911 mode:
 	// send is set when we advertised send and the peer advertised
 	// receive, receive when we advertised receive and the peer
@@ -289,6 +297,12 @@ func (f *fsm) acceptPeerOpen(m *bgp.BGPOpen) error {
 			if c.Code() == packet.BGPCapExtendedMessage && f.cfg.Caps.ExtendedMessage {
 				f.extendedMessagesNegotiated = true
 			}
+			if c.Code() == bgp.BGP_CAP_ROUTE_REFRESH {
+				f.routeRefreshNegotiated = true
+			}
+			if c.Code() == bgp.BGP_CAP_ENHANCED_ROUTE_REFRESH && f.cfg.Caps.EnhancedRefresh {
+				f.enhancedRefreshNegotiated = true
+			}
 			if ap, ok := c.(*bgp.CapAddPath); ok {
 				if peerAddPath == nil {
 					peerAddPath = make(map[bgp.Family]bgp.BGPAddPathMode, len(ap.Tuples))
@@ -409,6 +423,8 @@ func (f *fsm) readLoop() {
 		switch m := msg.Body.(type) {
 		case *bgp.BGPUpdate:
 			f.dispatchUpdate(m, ts)
+		case *bgp.BGPRouteRefresh:
+			f.dispatchRouteRefresh(m, ts)
 		case *bgp.BGPKeepAlive:
 		case *bgp.BGPNotification:
 			f.fail(fmt.Errorf("%w: code=%d sub=%d", ErrPeerRejected, m.ErrorCode, m.ErrorSubcode))

@@ -54,6 +54,37 @@ var ErrExtendedMessagesNotNegotiated = errors.New("xk6-bgp: useExtendedMessages 
 // collapse the caller's multiple paths into one.
 var ErrAddPathNotNegotiated = errors.New("xk6-bgp: pathId requires the ADD-PATH send direction to be negotiated for the family (RFC 7911)")
 
+// ErrRouteRefreshNotNegotiated is returned by RouteRefresh when the
+// peer did not advertise the RFC 2918 Route Refresh capability (code 2)
+// in its OPEN. RFC 2918 section 4 allows sending a ROUTE-REFRESH only
+// to a peer that advertised it.
+var ErrRouteRefreshNotNegotiated = errors.New("xk6-bgp: routeRefresh requires the peer to have advertised the RFC 2918 Route Refresh capability")
+
+// RouteRefresh sends one ROUTE-REFRESH request (demarcation 0) for the
+// family. The returned timestamp is captured immediately before the
+// write syscall — the anchor for bgp_route_refresh_duration.
+func (p *Peer) RouteRefresh(family bgp.Family) (timing.Timestamp, error) {
+	if p.fsm == nil || p.fsm.State() != StateEstablished {
+		return timing.Timestamp{}, p.sessionNotReadyErr()
+	}
+	if !p.fsm.routeRefreshNegotiated {
+		return timing.Timestamp{}, ErrRouteRefreshNotNegotiated
+	}
+	f := p.fsm
+	buf, err := BuildRouteRefresh(family, RouteRefreshNormal).Serialize()
+	if err != nil {
+		return timing.Timestamp{}, fmt.Errorf("routeRefresh: serialize: %w", err)
+	}
+	f.writeMu.Lock()
+	ts := timing.Now()
+	_, err = f.conn.Write(buf)
+	f.writeMu.Unlock()
+	if err != nil {
+		return timing.Timestamp{}, fmt.Errorf("routeRefresh: write: %w", err)
+	}
+	return ts, nil
+}
+
 func (p *Peer) Advertise(req AdvertiseRequest) (AdvertiseResult, error) {
 	if p.fsm == nil || p.fsm.State() != StateEstablished {
 		return AdvertiseResult{}, p.sessionNotReadyErr()

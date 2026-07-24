@@ -52,6 +52,22 @@ func BuildNotification(code, subcode uint8, data []byte) *bgp.BGPMessage {
 	return bgp.NewBGPNotificationMessage(code, subcode, data)
 }
 
+// ROUTE-REFRESH message subtypes. RFC 2918 section 3 defines the field
+// as Reserved (0); RFC 7313 section 3 redefines it as the message
+// subtype carrying the demarcations.
+const (
+	RouteRefreshNormal uint8 = 0 // RFC 2918 route refresh request
+	RouteRefreshBoRR   uint8 = 1 // RFC 7313 Beginning of Route Refresh
+	RouteRefreshEoRR   uint8 = 2 // RFC 7313 End of Route Refresh
+)
+
+// BuildRouteRefresh constructs a ROUTE-REFRESH message for the family.
+// demarcation must be one of the RouteRefresh* subtypes; senders that
+// only request a refresh use RouteRefreshNormal per RFC 2918.
+func BuildRouteRefresh(family bgp.Family, demarcation uint8) *bgp.BGPMessage {
+	return bgp.NewBGPRouteRefreshMessage(family.Afi(), demarcation, family.Safi())
+}
+
 // ReadMessage pulls one BGP message off r and returns both the raw
 // header+body bytes and the parsed message. Enforces the RFC 4271
 // 4096-byte cap on the message length; for sessions that negotiated

@@ -100,6 +100,40 @@ func TestBuildKeepaliveSerializes(t *testing.T) {
 	}
 }
 
+func TestBuildRouteRefresh_RoundTrip(t *testing.T) {
+	cases := []struct {
+		name        string
+		family      bgp.Family
+		demarcation uint8
+	}{
+		{"normal-ipv4-unicast", bgp.RF_IPv4_UC, RouteRefreshNormal},
+		{"borr-ipv6-unicast", bgp.RF_IPv6_UC, RouteRefreshBoRR},
+		{"eorr-vpnv4", bgp.RF_IPv4_VPN, RouteRefreshEoRR},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, err := BuildRouteRefresh(tc.family, tc.demarcation).Serialize()
+			if err != nil {
+				t.Fatalf("Serialize: %v", err)
+			}
+			parsed, err := bgp.ParseBGPMessage(buf)
+			if err != nil {
+				t.Fatalf("ParseBGPMessage: %v", err)
+			}
+			rr, ok := parsed.Body.(*bgp.BGPRouteRefresh)
+			if !ok {
+				t.Fatalf("body type %T not BGPRouteRefresh", parsed.Body)
+			}
+			if rr.AFI != tc.family.Afi() || rr.SAFI != tc.family.Safi() {
+				t.Fatalf("AFI/SAFI = %d/%d, want %d/%d", rr.AFI, rr.SAFI, tc.family.Afi(), tc.family.Safi())
+			}
+			if rr.Demarcation != tc.demarcation {
+				t.Fatalf("demarcation = %d, want %d", rr.Demarcation, tc.demarcation)
+			}
+		})
+	}
+}
+
 func TestReadMessage_RejectsOversizeWithoutExtended(t *testing.T) {
 	// Craft a synthetic header that advertises mlen=5000 (legal only
 	// when RFC 8654 Extended Messages was negotiated). The body bytes

@@ -21,6 +21,7 @@ type Metrics struct {
 	PrefixReceivedDuration *metrics.Metric // Trend, µs — sender T_tx → receiver T_rx of the last prefix
 	PrefixReceived         *metrics.Metric // Counter — cumulative NLRI count
 	PrefixSent             *metrics.Metric // Counter — cumulative advertised NLRI count
+	RouteRefreshDuration   *metrics.Metric // Trend, µs — ROUTE-REFRESH write → EoRR read (RFC 7313)
 }
 
 // Register installs the xk6-bgp metrics on the given Registry. Safe to
@@ -43,6 +44,9 @@ func Register(r *metrics.Registry) (*Metrics, error) {
 	}
 	if m.PrefixSent, err = r.NewMetric("bgp_prefix_sent", metrics.Counter); err != nil {
 		return nil, fmt.Errorf("bgp_prefix_sent: %w", err)
+	}
+	if m.RouteRefreshDuration, err = r.NewMetric("bgp_route_refresh_duration", metrics.Trend); err != nil {
+		return nil, fmt.Errorf("bgp_route_refresh_duration: %w", err)
 	}
 	return m, nil
 }
